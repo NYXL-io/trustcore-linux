@@ -10,6 +10,7 @@
 #include <linux/poll.h>
 #include <linux/cred.h>
 #include <linux/debugfs.h>
+#include <linux/ipv6.h>
 #include <linux/mm.h>
 #include <linux/limits.h>
 #include <linux/slab.h>
@@ -137,7 +138,7 @@ static void tc_unregister_stream(struct tc_sock *tc)
 {
 	spin_lock(&tc_streams_lock);
 	if (!hlist_unhashed(&tc->stream_node))
-		hash_del_init(&tc->stream_node);
+		hlist_del_init(&tc->stream_node);
 	spin_unlock(&tc_streams_lock);
 }
 
@@ -218,7 +219,7 @@ static void tc_unregister_listener(struct tc_sock *tc)
 {
 	spin_lock(&tc_listeners_lock);
 	if (!hlist_unhashed(&tc->listener_node))
-		hash_del_init(&tc->listener_node);
+		hlist_del_init(&tc->listener_node);
 	spin_unlock(&tc_listeners_lock);
 }
 
@@ -251,7 +252,7 @@ static void tc_unregister_request(struct tc_sock *tc)
 {
 	spin_lock(&tc_requests_lock);
 	if (!hlist_unhashed(&tc->req_node))
-		hash_del_init(&tc->req_node);
+		hlist_del_init(&tc->req_node);
 	spin_unlock(&tc_requests_lock);
 	tc->pending_req_id = 0;
 }
@@ -313,7 +314,7 @@ static bool tc_local_sockaddr_valid(const struct sock *sk, const void *aux,
 void trustcore_sock_abort_all(int err)
 {
 	struct tc_sock *tc;
-	struct tc_sock *tmp;
+	struct hlist_node *tmp;
 	struct sock *sk;
 	unsigned int bkt;
 
@@ -1193,12 +1194,6 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 	return (int)copied;
 }
 
-static int trustcore_sendpage(struct socket *sock, struct page *page, int offset,
-			      size_t size, int flags)
-{
-	return -EOPNOTSUPP;
-}
-
 static int trustcore_proto_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 {
 	if (!sk->sk_socket)
@@ -1345,7 +1340,6 @@ const struct proto_ops trustcore_inet_ops = {
 	.sendmsg = trustcore_sendmsg,
 	.recvmsg = trustcore_recvmsg,
 	.mmap = sock_no_mmap,
-	.sendpage = trustcore_sendpage,
 };
 EXPORT_SYMBOL_GPL(trustcore_inet_ops);
 
@@ -1367,7 +1361,6 @@ const struct proto_ops trustcore_inet6_ops = {
 	.sendmsg = trustcore_sendmsg,
 	.recvmsg = trustcore_recvmsg,
 	.mmap = sock_no_mmap,
-	.sendpage = trustcore_sendpage,
 };
 EXPORT_SYMBOL_GPL(trustcore_inet6_ops);
 
