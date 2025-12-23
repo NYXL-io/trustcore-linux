@@ -586,7 +586,7 @@ int trustcore_net_send_desc(struct tc_net_desc *desc,
 
 	wake_up_interruptible(&tc_ctx.ring_out.wait);
 	if (tc_ctx.out_eventfd)
-		eventfd_signal(tc_ctx.out_eventfd, 1);
+		eventfd_signal(tc_ctx.out_eventfd);
 	return 0;
 }
 
@@ -623,7 +623,7 @@ int trustcore_net_send_desc_iter(struct tc_net_desc *desc,
 
 	wake_up_interruptible(&tc_ctx.ring_out.wait);
 	if (tc_ctx.out_eventfd)
-		eventfd_signal(tc_ctx.out_eventfd, 1);
+		eventfd_signal(tc_ctx.out_eventfd);
 	return 0;
 }
 
@@ -647,7 +647,7 @@ static int tc_rx_thread(void *arg)
 				pr_debug_ratelimited("trustcore-net: drop invalid inbound desc type=%u\n",
 						     desc.type);
 				if (tc_ctx.in_eventfd)
-					eventfd_signal(tc_ctx.in_eventfd, 1);
+					eventfd_signal(tc_ctx.in_eventfd);
 				continue;
 			}
 
@@ -657,7 +657,7 @@ static int tc_rx_thread(void *arg)
 								    tc_ctx.ring_in.data + desc.data_off,
 								    desc.data_len);
 				if (tc_ctx.in_eventfd)
-					eventfd_signal(tc_ctx.in_eventfd, 1);
+					eventfd_signal(tc_ctx.in_eventfd);
 				continue;
 			}
 
@@ -681,7 +681,7 @@ static int tc_rx_thread(void *arg)
 			}
 
 			if (tc_ctx.in_eventfd)
-				eventfd_signal(tc_ctx.in_eventfd, 1);
+				eventfd_signal(tc_ctx.in_eventfd);
 		}
 	}
 
@@ -887,7 +887,7 @@ static int tc_device_mmap(struct file *file, struct vm_area_struct *vma)
 		return -EINVAL;
 	}
 
-	vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
 	if (remap_vmalloc_range(vma, mem, 0)) {
 		mutex_unlock(&tc_ctx.lock);
 		return -EAGAIN;
