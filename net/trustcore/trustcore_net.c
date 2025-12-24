@@ -108,7 +108,8 @@ static int tc_ring_init(struct tc_ring *ring,
 		return -EINVAL;
 	}
 
-	mem = vzalloc(size);
+	/* Use vmalloc_user so remap_vmalloc_range can map rings to userspace. */
+	mem = vmalloc_user(size);
 	if (!mem)
 		return -ENOMEM;
 
