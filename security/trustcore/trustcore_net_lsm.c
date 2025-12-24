@@ -32,12 +32,13 @@ static int trustcore_net_socket_create(int family, int type, int protocol, int k
 	return -EPERM;
 }
 
-static struct security_hook_list trustcore_net_hooks[] __lsm_ro_after_init = {
+static struct security_hook_list trustcore_net_hooks[] = {
 	LSM_HOOK_INIT(socket_create, trustcore_net_socket_create),
 };
 
-static struct lsm_id trustcore_net_lsmid __lsm_ro_after_init = {
+static struct lsm_id trustcore_net_lsmid = {
 	.name = "trustcore_net",
+	.id = LSM_ID_UNDEF,
 };
 
 static int __init trustcore_net_lsm_init(void)
