@@ -38,6 +38,8 @@ struct tc_rx_buf {
 	struct list_head list;
 	size_t offset;
 	size_t len;
+	u32 addr_len;
+	struct sockaddr_storage addr;
 	u8 data[];
 };
 
@@ -59,6 +61,8 @@ struct tc_sock {
 	int pending_status;
 	bool closing;
 	bool listening;
+	bool dgram_connected;
+	bool dgram_host_ready;
 	struct sockaddr_storage peer;
 	int peer_len;
 	struct sockaddr_storage local;
@@ -130,7 +134,8 @@ static inline struct tc_sock *tc_sk(struct sock *sk)
 static void tc_register_stream(struct tc_sock *tc)
 {
 	spin_lock(&tc_streams_lock);
-	hash_add(tc_streams, &tc->stream_node, tc->stream_id);
+	if (hlist_unhashed(&tc->stream_node))
+		hash_add(tc_streams, &tc->stream_node, tc->stream_id);
 	spin_unlock(&tc_streams_lock);
 }
 
@@ -161,6 +166,12 @@ static struct sock *tc_find_stream_sk(u64 stream_id)
 
 int trustcore_sock_deliver_recv(u64 stream_id, const void *data, u32 len)
 {
+	return trustcore_sock_deliver_recv_from(stream_id, data, len, NULL, 0);
+}
+
+int trustcore_sock_deliver_recv_from(u64 stream_id, const void *data, u32 len,
+				     const void *addr, u32 addr_len)
+{
 	struct sock *sk;
 	struct tc_sock *tc;
 	struct tc_rx_buf *buf;
@@ -168,6 +179,8 @@ int trustcore_sock_deliver_recv(u64 stream_id, const void *data, u32 len)
 
 	if (!data || !len)
 		return 0;
+	if (addr_len > sizeof(struct sockaddr_storage))
+		return -EINVAL;
 
 	sk = tc_find_stream_sk(stream_id);
 	if (!sk)
@@ -199,6 +212,11 @@ int trustcore_sock_deliver_recv(u64 stream_id, const void *data, u32 len)
 	}
 	memcpy(buf->data, data, len);
 	buf->len = len;
+	buf->addr_len = 0;
+	if (addr && addr_len) {
+		memcpy(&buf->addr, addr, addr_len);
+		buf->addr_len = addr_len;
+	}
 	spin_lock(&tc->rx_lock);
 	list_add_tail(&buf->list, &tc->rx_queue);
 	spin_unlock(&tc->rx_lock);
@@ -394,6 +412,60 @@ static void tc_handle_inbound(const struct tc_net_desc *desc,
 		kfree(aux);
 		return;
 	}
+	case TC_NET_DESC_DGRAM_BIND_RESP: {
+		struct sock *sk = tc_find_request_sk(desc->req_id);
+		struct tc_sock *tc;
+		if (!sk) {
+			kfree(data);
+			kfree(aux);
+			return;
+		}
+		tc = tc_sk(sk);
+		if (desc->status == 0) {
+			if (desc->stream_id && desc->stream_id != tc->stream_id)
+				tc->stream_id = desc->stream_id;
+			tc_register_stream(tc);
+			tc->dgram_host_ready = true;
+			if (tc_local_sockaddr_valid(sk, aux, aux_len)) {
+				memcpy(&tc->local, aux, aux_len);
+				tc->local_len = aux_len;
+			}
+		}
+		tc_complete_request(tc, desc->status);
+		sock_put(sk);
+		kfree(data);
+		kfree(aux);
+		return;
+	}
+	case TC_NET_DESC_DGRAM_CONNECT_RESP: {
+		struct sock *sk = tc_find_request_sk(desc->req_id);
+		struct tc_sock *tc;
+		if (!sk) {
+			kfree(data);
+			kfree(aux);
+			return;
+		}
+		tc = tc_sk(sk);
+		if (desc->status == 0) {
+			if (desc->stream_id && desc->stream_id != tc->stream_id)
+				tc->stream_id = desc->stream_id;
+			tc_register_stream(tc);
+			tc->dgram_host_ready = true;
+			tc->dgram_connected = true;
+			if (tc_local_sockaddr_valid(sk, aux, aux_len)) {
+				memcpy(&tc->local, aux, aux_len);
+				tc->local_len = aux_len;
+			}
+		} else {
+			tc->peer_len = 0;
+			tc->dgram_connected = false;
+		}
+		tc_complete_request(tc, desc->status);
+		sock_put(sk);
+		kfree(data);
+		kfree(aux);
+		return;
+	}
 	case TC_NET_DESC_LISTEN_RESP: {
 		struct sock *sk = tc_find_request_sk(desc->req_id);
 		struct tc_sock *tc;
@@ -468,8 +540,9 @@ static void tc_handle_inbound(const struct tc_net_desc *desc,
 		}
 		tc = tc_sk(sk);
 		tc->closing = true;
-		tc->inet.sk.sk_state = TCP_CLOSE;
 		tc->inet.sk.sk_err = desc->status;
+		if (sk->sk_type == SOCK_STREAM)
+			tc->inet.sk.sk_state = TCP_CLOSE;
 		tc->inet.sk.sk_state_change(&tc->inet.sk);
 		wake_up_interruptible(&tc->wait);
 		sock_put(sk);
@@ -521,6 +594,8 @@ static int tc_sock_get_timeout(long timeo, struct __kernel_sock_timeval *tv)
 	return sizeof(*tv);
 }
 
+static int trustcore_dgram_bind_host(struct socket *sock, bool nonblock);
+
 static int trustcore_init_sock(struct sock *sk)
 {
 	struct tc_sock *tc = tc_sk(sk);
@@ -531,6 +606,8 @@ static int trustcore_init_sock(struct sock *sk)
 	tc->pending_status = 0;
 	tc->closing = false;
 	tc->listening = false;
+	tc->dgram_connected = false;
+	tc->dgram_host_ready = false;
 	tc->peer_len = 0;
 	tc->local_len = 0;
 	init_waitqueue_head(&tc->wait);
@@ -595,7 +672,124 @@ static int trustcore_bind(struct socket *sock, struct sockaddr *addr, int addr_l
 	}
 	memcpy(&tc->local, addr, addr_len);
 	tc->local_len = addr_len;
+	if (sock->type == SOCK_DGRAM && trustcore_net_ready())
+		return trustcore_dgram_bind_host(sock, false);
 	return 0;
+}
+
+static int tc_dgram_prepare_local(struct socket *sock, struct tc_sock *tc)
+{
+	if (tc->local_len)
+		return 0;
+
+	if (sock->ops->family == PF_INET) {
+		struct sockaddr_in sin = {};
+
+		sin.sin_family = AF_INET;
+		sin.sin_addr.s_addr = htonl(INADDR_ANY);
+		sin.sin_port = 0;
+		memcpy(&tc->local, &sin, sizeof(sin));
+		tc->local_len = sizeof(sin);
+		return 0;
+	}
+#if IS_ENABLED(CONFIG_IPV6)
+	if (sock->ops->family == PF_INET6) {
+		struct sockaddr_in6 sin6 = {};
+
+		sin6.sin6_family = AF_INET6;
+		sin6.sin6_addr = in6addr_any;
+		sin6.sin6_port = 0;
+		memcpy(&tc->local, &sin6, sizeof(sin6));
+		tc->local_len = sizeof(sin6);
+		return 0;
+	}
+#endif
+	return -EINVAL;
+}
+
+static int trustcore_dgram_bind_host(struct socket *sock, bool nonblock)
+{
+	struct sock *sk = sock->sk;
+	struct tc_sock *tc = tc_sk(sk);
+	struct tc_net_desc desc = {};
+	struct {
+		struct tc_net_origin origin;
+		struct sockaddr_storage sa;
+	} auxbuf;
+	long timeout;
+	int rc;
+
+	if (tc->dgram_host_ready)
+		return 0;
+	if (!trustcore_net_ready())
+		return -ENETDOWN;
+	if (tc->pending_req_id) {
+		if (nonblock)
+			return -EAGAIN;
+		timeout = sock_sndtimeo(sk, nonblock);
+		rc = wait_event_interruptible_timeout(tc->wait,
+						      tc->pending_req_id == 0 || tc->closing ||
+						      !trustcore_net_ready(),
+						      timeout);
+		if (rc <= 0)
+			return rc == 0 ? -ETIMEDOUT : rc;
+		if (!trustcore_net_ready())
+			return -ENETDOWN;
+		if (tc->pending_status)
+			return -tc->pending_status;
+		return tc->dgram_host_ready ? 0 : -EIO;
+	}
+
+	rc = tc_dgram_prepare_local(sock, tc);
+	if (rc)
+		return rc;
+
+	if (!tc->stream_id)
+		tc->stream_id = atomic64_inc_return(&tc_next_stream_id);
+	tc->pending_status = 0;
+	sk->sk_err = 0;
+
+	desc.type = TC_NET_DESC_DGRAM_BIND;
+	desc.stream_id = tc->stream_id;
+	desc.req_id = atomic64_inc_return(&tc_next_req_id);
+	desc.status = 0;
+	desc.flags = TC_NET_DESC_F_ORIGIN;
+	auxbuf.origin.tgid = (u32)current->tgid;
+	auxbuf.origin.uid = (u32)from_kuid_munged(current_user_ns(), current_uid());
+	auxbuf.origin.gid = (u32)from_kgid_munged(current_user_ns(), current_gid());
+	auxbuf.origin.reserved = 0;
+	memset(&auxbuf.sa, 0, sizeof(auxbuf.sa));
+	memcpy(&auxbuf.sa, &tc->local, tc->local_len);
+
+	tc_register_request(tc, desc.req_id);
+	rc = trustcore_net_send_desc(&desc, NULL, 0, &auxbuf,
+				     sizeof(auxbuf.origin) + tc->local_len,
+				     nonblock);
+	if (rc) {
+		tc_unregister_request(tc);
+		return rc;
+	}
+
+	if (nonblock)
+		return -EAGAIN;
+
+	timeout = sock_sndtimeo(sk, nonblock);
+	rc = wait_event_interruptible_timeout(tc->wait,
+					      tc->pending_req_id == 0 || tc->closing ||
+					      !trustcore_net_ready(),
+					      timeout);
+	if (rc <= 0) {
+		tc_unregister_request(tc);
+		return rc == 0 ? -ETIMEDOUT : rc;
+	}
+	if (!trustcore_net_ready()) {
+		if (tc->pending_req_id)
+			tc_unregister_request(tc);
+		return -ENETDOWN;
+	}
+	if (tc->pending_status)
+		return -tc->pending_status;
+	return tc->dgram_host_ready ? 0 : -EIO;
 }
 
 static int trustcore_connect(struct socket *sock, struct sockaddr *addr,
@@ -611,6 +805,86 @@ static int trustcore_connect(struct socket *sock, struct sockaddr *addr,
 	bool nonblock = flags & O_NONBLOCK;
 	long timeout;
 	int rc;
+
+	if (sock->type == SOCK_DGRAM) {
+		if (!trustcore_net_ready())
+			return -ENETDOWN;
+		if (addr_len < sizeof(sa_family_t))
+			return -EINVAL;
+		if (addr->sa_family == AF_UNSPEC)
+			return -EINVAL;
+		if (sock->ops->family == PF_INET) {
+			if (addr->sa_family != AF_INET ||
+			    addr_len != sizeof(struct sockaddr_in))
+				return -EINVAL;
+		} else if (sock->ops->family == PF_INET6) {
+			if (addr->sa_family != AF_INET6 ||
+			    addr_len != sizeof(struct sockaddr_in6))
+				return -EINVAL;
+		} else {
+			return -EINVAL;
+		}
+
+		if (tc->local_len && !tc->dgram_host_ready) {
+			rc = trustcore_dgram_bind_host(sock, nonblock);
+			if (rc)
+				return rc;
+		}
+
+		memcpy(&tc->peer, addr, addr_len);
+		tc->peer_len = addr_len;
+		tc->pending_status = 0;
+		tc->dgram_connected = false;
+		sk->sk_err = 0;
+
+		if (!tc->stream_id)
+			tc->stream_id = atomic64_inc_return(&tc_next_stream_id);
+		desc.type = TC_NET_DESC_DGRAM_CONNECT;
+		desc.stream_id = tc->stream_id;
+		desc.req_id = atomic64_inc_return(&tc_next_req_id);
+		desc.status = 0;
+		desc.flags = TC_NET_DESC_F_ORIGIN;
+		auxbuf.origin.tgid = (u32)current->tgid;
+		auxbuf.origin.uid = (u32)from_kuid_munged(current_user_ns(), current_uid());
+		auxbuf.origin.gid = (u32)from_kgid_munged(current_user_ns(), current_gid());
+		auxbuf.origin.reserved = 0;
+		memset(&auxbuf.sa, 0, sizeof(auxbuf.sa));
+		memcpy(&auxbuf.sa, addr, addr_len);
+
+		tc_register_request(tc, desc.req_id);
+		rc = trustcore_net_send_desc(&desc, NULL, 0, &auxbuf,
+					     sizeof(auxbuf.origin) + addr_len, nonblock);
+		if (rc) {
+			tc_unregister_request(tc);
+			tc->peer_len = 0;
+			return rc;
+		}
+
+		if (nonblock)
+			return -EINPROGRESS;
+
+		timeout = sock_sndtimeo(sk, flags & O_NONBLOCK);
+		rc = wait_event_interruptible_timeout(tc->wait,
+						      tc->pending_req_id == 0 || tc->closing ||
+						      !trustcore_net_ready(),
+						      timeout);
+		if (rc <= 0) {
+			tc_unregister_request(tc);
+			tc->peer_len = 0;
+			return rc == 0 ? -ETIMEDOUT : rc;
+		}
+		if (!trustcore_net_ready()) {
+			if (tc->pending_req_id)
+				tc_unregister_request(tc);
+			tc->peer_len = 0;
+			return -ENETDOWN;
+		}
+		if (tc->pending_status) {
+			tc->peer_len = 0;
+			return -tc->pending_status;
+		}
+		return 0;
+	}
 
 	if (!trustcore_net_ready())
 		return -ENETDOWN;
@@ -698,6 +972,8 @@ static int trustcore_listen(struct socket *sock, int backlog)
 	long timeout;
 	int rc;
 
+	if (sock->type == SOCK_DGRAM)
+		return -EOPNOTSUPP;
 	if (!trustcore_net_ready())
 		return -ENETDOWN;
 	if (!tc->local_len) {
@@ -797,6 +1073,8 @@ static int trustcore_accept(struct socket *sock, struct socket *newsock,
 	long timeout;
 	int rc;
 
+	if (sock->type == SOCK_DGRAM)
+		return -EOPNOTSUPP;
 	if (!listener->listening)
 		return -EINVAL;
 
@@ -866,8 +1144,12 @@ static int trustcore_getname(struct socket *sock, struct sockaddr *addr, int pee
 	int len = peer ? tc->peer_len : tc->local_len;
 
 	if (peer) {
-		if (sock->sk->sk_state != TCP_ESTABLISHED)
+		if (sock->type == SOCK_DGRAM) {
+			if (!tc->peer_len)
+				return -ENOTCONN;
+		} else if (sock->sk->sk_state != TCP_ESTABLISHED) {
 			return -ENOTCONN;
+		}
 		if (!tc->peer_len)
 			return -ENOTCONN;
 		memcpy(addr, &tc->peer, tc->peer_len);
@@ -899,7 +1181,7 @@ static __poll_t trustcore_poll(struct file *file, struct socket *sock, poll_tabl
 		spin_unlock(&tc->rx_lock);
 	}
 
-	if (sk->sk_state == TCP_ESTABLISHED &&
+	if ((sock->type == SOCK_DGRAM || sk->sk_state == TCP_ESTABLISHED) &&
 	    trustcore_net_tx_ready(TRUSTCORE_TX_READY_MIN))
 		mask |= POLLOUT | POLLWRNORM;
 	if (sk->sk_err)
@@ -919,6 +1201,17 @@ static int trustcore_shutdown(struct socket *sock, int how)
 	struct sock *sk = sock->sk;
 	struct tc_sock *tc = tc_sk(sk);
 	struct tc_net_desc desc = {};
+
+	if (sock->type == SOCK_DGRAM) {
+		if (tc->stream_id && trustcore_net_ready()) {
+			desc.type = TC_NET_DESC_CLOSE;
+			desc.stream_id = tc->stream_id;
+			desc.status = 0;
+			trustcore_net_send_desc(&desc, NULL, 0, NULL, 0, true);
+		}
+		tc->closing = true;
+		return 0;
+	}
 
 	if (!tc->stream_id || !trustcore_net_ready())
 		return 0;
@@ -1102,6 +1395,76 @@ static int trustcore_sendmsg(struct socket *sock, struct msghdr *msg, size_t len
 	bool nonblock = msg->msg_flags & MSG_DONTWAIT;
 	int rc;
 
+	if (sock->type == SOCK_DGRAM) {
+		const struct sockaddr *daddr = NULL;
+		u32 daddr_len = 0;
+		u32 max_payload;
+
+		if (!trustcore_net_ready())
+			return -ENETDOWN;
+		if (!len)
+			return 0;
+
+		if (msg->msg_name && msg->msg_namelen) {
+			const struct sockaddr *sa = msg->msg_name;
+
+			if (msg->msg_namelen < sizeof(sa_family_t))
+				return -EINVAL;
+			if (sock->ops->family == PF_INET) {
+				if (sa->sa_family != AF_INET ||
+				    msg->msg_namelen != sizeof(struct sockaddr_in))
+					return -EINVAL;
+			} else if (sock->ops->family == PF_INET6) {
+				if (sa->sa_family != AF_INET6 ||
+				    msg->msg_namelen != sizeof(struct sockaddr_in6))
+					return -EINVAL;
+			} else {
+				return -EINVAL;
+			}
+			daddr = sa;
+			daddr_len = msg->msg_namelen;
+		} else {
+			if (!tc->dgram_connected || !tc->peer_len)
+				return -ENOTCONN;
+		}
+
+		if (!tc->stream_id)
+			tc->stream_id = atomic64_inc_return(&tc_next_stream_id);
+
+		if (!tc->dgram_host_ready) {
+			rc = trustcore_dgram_bind_host(sock, nonblock);
+			if (rc)
+				return rc == -ENOSPC ? -EAGAIN : rc;
+		}
+
+		max_payload = trustcore_net_max_payload();
+		if (!max_payload)
+			return -ENETDOWN;
+		if (len > max_payload)
+			return -EMSGSIZE;
+
+		{
+			struct tc_net_desc desc = {};
+
+			desc.type = TC_NET_DESC_DGRAM_SEND;
+			desc.stream_id = tc->stream_id;
+			desc.req_id = 0;
+			desc.status = 0;
+			desc.flags = 0;
+			rc = trustcore_net_send_desc_iter(&desc, &msg->msg_iter,
+							  (u32)len,
+							  daddr, daddr_len,
+							  nonblock);
+			if (rc) {
+				if (rc == -ENOSPC)
+					rc = -EAGAIN;
+				return rc;
+			}
+		}
+
+		return (int)len;
+	}
+
 	if (!trustcore_net_ready())
 		return -ENETDOWN;
 	if (sk->sk_state != TCP_ESTABLISHED || !tc->stream_id)
@@ -1140,6 +1503,72 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 	size_t copied = 0;
 	long timeout;
 	int rc;
+
+	if (sock->type == SOCK_DGRAM) {
+		if (!trustcore_net_ready())
+			return -ENETDOWN;
+
+		if (!tc->dgram_host_ready) {
+			rc = trustcore_dgram_bind_host(sock, flags & MSG_DONTWAIT);
+			if (rc)
+				return rc;
+		}
+
+		for (;;) {
+			spin_lock(&tc->rx_lock);
+			buf = list_first_entry_or_null(&tc->rx_queue, struct tc_rx_buf, list);
+			if (buf)
+				list_del(&buf->list);
+			spin_unlock(&tc->rx_lock);
+
+			if (buf)
+				break;
+
+			if (flags & MSG_DONTWAIT)
+				return -EAGAIN;
+
+			timeout = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
+			rc = wait_event_interruptible_timeout(tc->wait,
+							      !list_empty(&tc->rx_queue) || tc->closing,
+							      timeout);
+			if (rc <= 0)
+				return rc == 0 ? -ETIMEDOUT : rc;
+			if (tc->closing)
+				return 0;
+		}
+
+		if (len > buf->len)
+			len = buf->len;
+		if (copy_to_iter(buf->data, len, &msg->msg_iter) != len) {
+			spin_lock(&tc->rx_lock);
+			tc->rx_queued_bytes -= buf->len;
+			tc->rx_queued_bufs--;
+			spin_unlock(&tc->rx_lock);
+			kfree(buf);
+			return -EFAULT;
+		}
+		copied = len;
+		if (buf->addr_len && msg->msg_name) {
+			if (msg->msg_namelen < buf->addr_len) {
+				spin_lock(&tc->rx_lock);
+				tc->rx_queued_bytes -= buf->len;
+				tc->rx_queued_bufs--;
+				spin_unlock(&tc->rx_lock);
+				kfree(buf);
+				return -EINVAL;
+			}
+			memcpy(msg->msg_name, &buf->addr, buf->addr_len);
+			msg->msg_namelen = buf->addr_len;
+		}
+		if (len < buf->len)
+			msg->msg_flags |= MSG_TRUNC;
+		spin_lock(&tc->rx_lock);
+		tc->rx_queued_bytes -= buf->len;
+		tc->rx_queued_bufs--;
+		spin_unlock(&tc->rx_lock);
+		kfree(buf);
+		return (int)copied;
+	}
 
 	if (!trustcore_net_ready())
 		return -ENETDOWN;
@@ -1208,8 +1637,12 @@ static int trustcore_proto_recvmsg(struct sock *sk, struct msghdr *msg, size_t l
 	if (!sk->sk_socket)
 		return -EINVAL;
 	rc = trustcore_recvmsg(sk->sk_socket, msg, len, flags);
-	if (rc >= 0 && addr_len)
-		*addr_len = 0;
+	if (rc >= 0 && addr_len) {
+		if (sk->sk_socket->type == SOCK_DGRAM)
+			*addr_len = msg->msg_namelen;
+		else
+			*addr_len = 0;
+	}
 	return rc;
 }
 
@@ -1267,10 +1700,15 @@ bool trustcore_net_should_intercept(int sock_type, int protocol)
 	uid_t uid;
 	gid_t gid;
 
-	if (sock_type != SOCK_STREAM)
+	if (sock_type == SOCK_STREAM) {
+		if (protocol != 0 && protocol != IPPROTO_TCP)
+			return false;
+	} else if (sock_type == SOCK_DGRAM) {
+		if (protocol != 0 && protocol != IPPROTO_UDP)
+			return false;
+	} else {
 		return false;
-	if (protocol != 0 && protocol != IPPROTO_TCP)
-		return false;
+	}
 
 	/* Fail-closed: intercept even when control plane is not ready. */
 	switch (mode) {

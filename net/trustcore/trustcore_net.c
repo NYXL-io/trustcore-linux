@@ -445,6 +445,9 @@ static bool tc_desc_validate_in(const struct tc_ring *ring,
 	case TC_NET_DESC_ACCEPT:
 	case TC_NET_DESC_RECV:
 	case TC_NET_DESC_CLOSE:
+	case TC_NET_DESC_DGRAM_BIND_RESP:
+	case TC_NET_DESC_DGRAM_CONNECT_RESP:
+	case TC_NET_DESC_DGRAM_RECV:
 		break;
 	default:
 		atomic64_inc(&tc_in_unknown_type);
@@ -497,6 +500,8 @@ static bool tc_desc_validate_in(const struct tc_ring *ring,
 		break;
 	case TC_NET_DESC_CONNECT_RESP:
 	case TC_NET_DESC_LISTEN_RESP:
+	case TC_NET_DESC_DGRAM_BIND_RESP:
+	case TC_NET_DESC_DGRAM_CONNECT_RESP:
 		if (!d->req_id || d->listener_id || d->data_len ||
 		    d->status > MAX_ERRNO) {
 			atomic64_inc(&tc_in_bad_desc);
@@ -513,6 +518,18 @@ static bool tc_desc_validate_in(const struct tc_ring *ring,
 		break;
 	case TC_NET_DESC_ACCEPT:
 		if (d->req_id || !d->listener_id || !d->stream_id || d->data_len ||
+		    d->status) {
+			atomic64_inc(&tc_in_bad_desc);
+			return false;
+		}
+		if (!tc_aux_sockaddr_valid(ring, d)) {
+			atomic64_inc(&tc_in_bad_desc);
+			return false;
+		}
+		break;
+	case TC_NET_DESC_DGRAM_RECV:
+		if (!d->stream_id || d->req_id || d->listener_id ||
+		    !d->data_len || d->data_len > ring->hdr->max_payload ||
 		    d->status) {
 			atomic64_inc(&tc_in_bad_desc);
 			return false;
@@ -657,6 +674,17 @@ static int tc_rx_thread(void *arg)
 					trustcore_sock_deliver_recv(desc.stream_id,
 								    tc_ctx.ring_in.data + desc.data_off,
 								    desc.data_len);
+				if (tc_ctx.in_eventfd)
+					eventfd_signal(tc_ctx.in_eventfd);
+				continue;
+			}
+			if (desc.type == TC_NET_DESC_DGRAM_RECV) {
+				if (desc.data_len)
+					trustcore_sock_deliver_recv_from(desc.stream_id,
+									 tc_ctx.ring_in.data + desc.data_off,
+									 desc.data_len,
+									 desc.aux_len ? tc_ctx.ring_in.data + desc.aux_off : NULL,
+									 desc.aux_len);
 				if (tc_ctx.in_eventfd)
 					eventfd_signal(tc_ctx.in_eventfd);
 				continue;

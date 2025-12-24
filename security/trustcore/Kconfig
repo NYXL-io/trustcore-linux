@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config SECURITY_TRUSTCORE_NET
+	bool "Trustcore network socket gating"
+	depends on SECURITY && SECURITY_NETWORK && TRUSTCORE_NET
+	default n
+	help
+	  This enables the Trustcore network LSM, which restricts socket
+	  creation to AF_INET/AF_INET6 TCP and UDP while allowing AF_UNIX
+	  and AF_VSOCK. All other socket types and families are denied.
+
+	  If you are unsure how to answer this question, answer N.

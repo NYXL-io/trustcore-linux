@@ -8,6 +8,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <linux/capability.h>
+#include <netinet/in.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/poll.h>
@@ -20,6 +22,7 @@
 
 #define DEV_PATH "/dev/trustcore-net"
 #define PARAM_PATH "/sys/module/trustcore_sock/parameters/trustcore_intercept_mode"
+#define LSM_PATH "/sys/kernel/security/lsm"
 
 struct tc_ring_view {
 	struct tc_net_ring_header *hdr;
@@ -31,6 +34,43 @@ struct listen_args {
 	int fd;
 	int rc;
 };
+
+static int trustcore_lsm_status(void)
+{
+	char buf[256];
+	ssize_t len;
+	int fd;
+
+	fd = open(LSM_PATH, O_RDONLY);
+	if (fd < 0)
+		return -errno;
+	len = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (len <= 0)
+		return -EIO;
+	buf[len] = '\0';
+	return strstr(buf, "trustcore_net") ? 1 : 0;
+}
+
+static bool cap_net_raw_enabled(void)
+{
+	char line[256];
+	unsigned long long caps = 0;
+	FILE *fp;
+
+	fp = fopen("/proc/self/status", "r");
+	if (!fp)
+		return false;
+	while (fgets(line, sizeof(line), fp)) {
+		if (strncmp(line, "CapEff:", 7) == 0) {
+			if (sscanf(line + 7, "%llx", &caps) != 1)
+				caps = 0;
+			break;
+		}
+	}
+	fclose(fp);
+	return !!(caps & (1ULL << CAP_NET_RAW));
+}
 
 static void ring_init(void *mem, struct tc_ring_view *ring)
 {
@@ -169,18 +209,26 @@ int main(void)
 	struct tc_net_desc resp = {};
 	struct sockaddr_in sin = {};
 	struct sockaddr_in peer = {};
+	struct sockaddr_in udp_peer = {};
+	struct sockaddr_in udp_from = {};
 	struct listen_args largs = {};
+	const char udp_send[] = "ping";
+	const char udp_recv[] = "pong";
+	char udp_buf[16];
+	u64 udp_stream_id = 0;
 	pthread_t lthread;
 	void *out_map = MAP_FAILED;
 	void *in_map = MAP_FAILED;
 	int intercept_rc = 0;
+	int udpfd = -1;
 	int devfd;
 	int srvfd = -1;
 	int clifd = -1;
 	int accfd = -1;
 	int rc;
+	int lsm_status;
 
-	ksft_set_plan(1);
+	ksft_set_plan(3);
 
 	if (geteuid() != 0)
 		ksft_exit_skip("requires root\n");
@@ -329,9 +377,135 @@ int main(void)
 
 	ksft_test_result_pass("trustcore net basic flow\n");
 
+	udpfd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+	if (udpfd < 0)
+		ksft_exit_fail_msg("udp socket failed: %s\n", strerror(errno));
+
+	memset(&udp_peer, 0, sizeof(udp_peer));
+	udp_peer.sin_family = AF_INET;
+	udp_peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	udp_peer.sin_port = htons(54321);
+
+	rc = sendto(udpfd, udp_send, sizeof(udp_send) - 1, MSG_DONTWAIT,
+		    (struct sockaddr *)&udp_peer, sizeof(udp_peer));
+	if (rc >= 0) {
+		if (intercept_rc) {
+			ksft_test_result_skip("trustcore net udp flow (intercept_mode write failed: %s)\n",
+					      strerror(-intercept_rc));
+			goto lsm_test;
+		}
+		ksft_exit_fail_msg("udp sendto unexpectedly succeeded\n");
+	}
+	if (errno != EAGAIN && errno != EWOULDBLOCK)
+		ksft_exit_fail_msg("udp sendto expected EAGAIN: %s\n", strerror(errno));
+
+	rc = wait_for_desc(&ring_out, &desc);
+	if (rc) {
+		if (intercept_rc) {
+			ksft_test_result_skip("trustcore net udp flow (intercept_mode write failed: %s)\n",
+					      strerror(-intercept_rc));
+			goto lsm_test;
+		}
+		ksft_exit_fail_msg("no DGRAM_BIND descriptor observed\n");
+	}
+	if (desc.type != TC_NET_DESC_DGRAM_BIND)
+		ksft_exit_fail_msg("unexpected desc type %u\n", desc.type);
+
+	udp_stream_id = desc.stream_id;
+	memset(&resp, 0, sizeof(resp));
+	resp.type = TC_NET_DESC_DGRAM_BIND_RESP;
+	resp.req_id = desc.req_id;
+	resp.stream_id = desc.stream_id;
+	resp.status = 0;
+	rc = ring_push(&ring_in, &resp, NULL, 0, NULL, 0);
+	if (rc)
+		ksft_exit_fail_msg("ring_push dgram_bind_resp failed\n");
+	ioctl(devfd, TC_NET_IOC_KICK);
+
+	rc = -1;
+	for (int i = 0; i < 1000; i++) {
+		rc = sendto(udpfd, udp_send, sizeof(udp_send) - 1, MSG_DONTWAIT,
+			    (struct sockaddr *)&udp_peer, sizeof(udp_peer));
+		if (rc == (int)(sizeof(udp_send) - 1))
+			break;
+		if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+			usleep(1000);
+			continue;
+		}
+		ksft_exit_fail_msg("udp sendto failed: %s\n", strerror(errno));
+	}
+	if (rc != (int)(sizeof(udp_send) - 1))
+		ksft_exit_fail_msg("udp sendto timed out\n");
+
+	rc = wait_for_desc(&ring_out, &desc);
+	if (rc)
+		ksft_exit_fail_msg("no DGRAM_SEND descriptor observed\n");
+	if (desc.type != TC_NET_DESC_DGRAM_SEND)
+		ksft_exit_fail_msg("unexpected desc type %u\n", desc.type);
+	if (desc.stream_id != udp_stream_id || desc.data_len != sizeof(udp_send) - 1)
+		ksft_exit_fail_msg("unexpected DGRAM_SEND fields\n");
+
+	memset(&resp, 0, sizeof(resp));
+	resp.type = TC_NET_DESC_DGRAM_RECV;
+	resp.stream_id = udp_stream_id;
+	resp.status = 0;
+	rc = ring_push(&ring_in, &resp, udp_recv, sizeof(udp_recv) - 1,
+		       &udp_peer, sizeof(udp_peer));
+	if (rc)
+		ksft_exit_fail_msg("ring_push dgram_recv failed\n");
+	ioctl(devfd, TC_NET_IOC_KICK);
+
+	rc = -1;
+	for (int i = 0; i < 1000; i++) {
+		socklen_t from_len = sizeof(udp_from);
+
+		rc = recvfrom(udpfd, udp_buf, sizeof(udp_buf), MSG_DONTWAIT,
+			      (struct sockaddr *)&udp_from, &from_len);
+		if (rc >= 0)
+			break;
+		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+			usleep(1000);
+			continue;
+		}
+		ksft_exit_fail_msg("udp recvfrom failed: %s\n", strerror(errno));
+	}
+	if (rc != (int)(sizeof(udp_recv) - 1))
+		ksft_exit_fail_msg("udp recvfrom length mismatch\n");
+	if (memcmp(udp_buf, udp_recv, sizeof(udp_recv) - 1))
+		ksft_exit_fail_msg("udp recvfrom payload mismatch\n");
+	if (udp_from.sin_family != AF_INET ||
+	    udp_from.sin_addr.s_addr != udp_peer.sin_addr.s_addr ||
+	    udp_from.sin_port != udp_peer.sin_port)
+		ksft_exit_fail_msg("udp recvfrom peer mismatch\n");
+
+	ksft_test_result_pass("trustcore net udp flow\n");
+
+lsm_test:
+	lsm_status = trustcore_lsm_status();
+	if (lsm_status < 0) {
+		ksft_test_result_skip("trustcore net lsm gating (lsm list unavailable)\n");
+	} else if (lsm_status == 0) {
+		ksft_test_result_skip("trustcore net lsm gating (trustcore_net not active)\n");
+	} else if (!cap_net_raw_enabled()) {
+		ksft_test_result_skip("trustcore net lsm gating (missing CAP_NET_RAW)\n");
+	} else {
+		int rawfd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+
+		if (rawfd >= 0) {
+			close(rawfd);
+			ksft_test_result_fail("trustcore net lsm gating\n");
+		} else if (errno == EPERM || errno == EACCES) {
+			ksft_test_result_pass("trustcore net lsm gating\n");
+		} else {
+			ksft_test_result_skip("trustcore net lsm gating (raw socket unavailable: %s)\n",
+					      strerror(errno));
+		}
+	}
+
 	close(accfd);
 	close(clifd);
 	close(srvfd);
+	close(udpfd);
 	munmap(out_map, layout.out_size);
 	munmap(in_map, layout.in_size);
 	close(devfd);

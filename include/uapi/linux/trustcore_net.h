@@ -3,9 +3,9 @@
 
 #include <linux/types.h>
 
-#define TRUSTCORE_NET_VERSION 2u
+#define TRUSTCORE_NET_VERSION 3u
 #define TRUSTCORE_NET_MAX_PAYLOAD (256u * 1024u)
-/* Version 2 adds listener_id in tc_net_desc; older versions are rejected. */
+/* Version 2 adds listener_id in tc_net_desc; version 3 adds UDP descriptors. */
 
 enum tc_net_desc_type {
 	TC_NET_DESC_CONNECT = 1,
@@ -17,6 +17,12 @@ enum tc_net_desc_type {
 	TC_NET_DESC_RECV = 7,
 	TC_NET_DESC_CLOSE = 8,
 	TC_NET_DESC_POLL_HINT = 9,
+	TC_NET_DESC_DGRAM_BIND = 10,
+	TC_NET_DESC_DGRAM_BIND_RESP = 11,
+	TC_NET_DESC_DGRAM_CONNECT = 12,
+	TC_NET_DESC_DGRAM_CONNECT_RESP = 13,
+	TC_NET_DESC_DGRAM_SEND = 14,
+	TC_NET_DESC_DGRAM_RECV = 15,
 };
 
 /* Descriptor flags */
@@ -29,7 +35,7 @@ enum tc_net_desc_flags {
 };
 
 /*
- * Descriptor semantics (v2):
+ * Descriptor semantics (v3):
  * - Payloads are contiguous; no wrap. data_off/aux_off are only valid when the
  *   corresponding length is non-zero.
  * - stream_id: long-lived handle for a connection or listener.
@@ -47,6 +53,12 @@ enum tc_net_desc_flags {
  * RECV: stream_id!=0, data_len>0, aux_len=0.
  * CLOSE: stream_id!=0, status optional error.
  * POLL_HINT: reserved; fields unused.
+ * DGRAM_BIND: stream_id!=0, req_id!=0, aux=origin+sockaddr(local).
+ * DGRAM_BIND_RESP: req_id!=0, stream_id!=0 on success; aux optional local sockaddr.
+ * DGRAM_CONNECT: stream_id!=0, req_id!=0, aux=origin+sockaddr(remote).
+ * DGRAM_CONNECT_RESP: req_id!=0, stream_id!=0 on success; aux optional local sockaddr.
+ * DGRAM_SEND: stream_id!=0, data_len>0, aux optional sockaddr(remote).
+ * DGRAM_RECV: stream_id!=0, data_len>0, aux optional sockaddr(remote).
  *
  * Status semantics:
  * - For *_RESP: status is 0 or a positive errno value.
