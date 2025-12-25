@@ -13,8 +13,9 @@ static void trustcore_net_log_deny(int family, int type, int protocol)
 	uid_t uid = from_kuid_munged(current_user_ns(), current_uid());
 	gid_t gid = from_kgid_munged(current_user_ns(), current_gid());
 
-	pr_warn_ratelimited("trustcore_net: denied socket family=%d type=%d proto=%d tgid=%u uid=%u gid=%u\n",
-			    family, type, protocol, current->tgid, uid, gid);
+	pr_err("trustcore_net: denied socket family=%d type=%d proto=%d tgid=%u uid=%u gid=%u\n",
+	       family, type, protocol, current->tgid, uid, gid);
+	dump_stack();
 }
 
 static int trustcore_net_socket_create(int family, int type, int protocol, int kern)
