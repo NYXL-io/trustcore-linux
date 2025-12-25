@@ -3,6 +3,7 @@
 #include <linux/kernel.h>
 #include <linux/lsm_hooks.h>
 #include <linux/net.h>
+#include <linux/netlink.h>
 #include <linux/socket.h>
 
 static int trustcore_net_socket_create(int family, int type, int protocol, int kern)
@@ -12,6 +13,16 @@ static int trustcore_net_socket_create(int family, int type, int protocol, int k
 
 	if (family == AF_UNIX || family == AF_VSOCK)
 		return 0;
+
+	if (family == AF_NETLINK) {
+		int sock_type = type & SOCK_TYPE_MASK;
+
+		if (sock_type == SOCK_RAW || sock_type == SOCK_DGRAM) {
+			if (protocol == NETLINK_ROUTE || protocol == NETLINK_GENERIC)
+				return 0;
+		}
+		return -EPERM;
+	}
 
 	if (family == AF_INET || family == AF_INET6) {
 		int sock_type = type & SOCK_TYPE_MASK;
