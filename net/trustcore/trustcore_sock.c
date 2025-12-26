@@ -774,6 +774,7 @@ static int trustcore_dgram_bind_host(struct socket *sock, bool nonblock)
 		struct sockaddr_storage sa;
 	} auxbuf;
 	long timeout;
+	long wait_rc;
 	int rc;
 
 	if (tc->dgram_host_ready)
@@ -787,14 +788,14 @@ static int trustcore_dgram_bind_host(struct socket *sock, bool nonblock)
 		if (nonblock)
 			return -EAGAIN;
 		timeout = sock_sndtimeo(sk, nonblock);
-		rc = wait_event_interruptible_timeout(tc->wait,
-						      tc->pending_req_id == 0 || tc->closing ||
-						      !trustcore_net_ready(),
-						      timeout);
-		if (rc <= 0) {
-			pr_err("trustcore_net: dgram_bind_host wait rc=%d tgid=%u comm=%s\n",
-			       rc, current->tgid, current->comm);
-			return rc == 0 ? -ETIMEDOUT : rc;
+		wait_rc = wait_event_interruptible_timeout(tc->wait,
+							   tc->pending_req_id == 0 || tc->closing ||
+							   !trustcore_net_ready(),
+							   timeout);
+		if (wait_rc <= 0) {
+			pr_err("trustcore_net: dgram_bind_host wait rc=%ld tgid=%u comm=%s\n",
+			       wait_rc, current->tgid, current->comm);
+			return wait_rc == 0 ? -ETIMEDOUT : (int)wait_rc;
 		}
 		if (!trustcore_net_ready())
 			return -ENETDOWN;
@@ -848,15 +849,15 @@ static int trustcore_dgram_bind_host(struct socket *sock, bool nonblock)
 		return -EAGAIN;
 
 	timeout = sock_sndtimeo(sk, nonblock);
-	rc = wait_event_interruptible_timeout(tc->wait,
-					      tc->pending_req_id == 0 || tc->closing ||
-					      !trustcore_net_ready(),
-					      timeout);
-	if (rc <= 0) {
-		pr_err("trustcore_net: dgram_bind_host wait2 rc=%d tgid=%u comm=%s\n",
-		       rc, current->tgid, current->comm);
+	wait_rc = wait_event_interruptible_timeout(tc->wait,
+						   tc->pending_req_id == 0 || tc->closing ||
+						   !trustcore_net_ready(),
+						   timeout);
+	if (wait_rc <= 0) {
+		pr_err("trustcore_net: dgram_bind_host wait2 rc=%ld tgid=%u comm=%s\n",
+		       wait_rc, current->tgid, current->comm);
 		tc_unregister_request(tc);
-		return rc == 0 ? -ETIMEDOUT : rc;
+		return wait_rc == 0 ? -ETIMEDOUT : (int)wait_rc;
 	}
 	if (!trustcore_net_ready()) {
 		if (tc->pending_req_id)
@@ -883,6 +884,7 @@ static int trustcore_connect(struct socket *sock, struct sockaddr *addr,
 	} auxbuf;
 	bool nonblock = flags & O_NONBLOCK;
 	long timeout;
+	long wait_rc;
 	int rc;
 
 	if (sock->type == SOCK_DGRAM) {
@@ -943,14 +945,14 @@ static int trustcore_connect(struct socket *sock, struct sockaddr *addr,
 			return -EINPROGRESS;
 
 		timeout = sock_sndtimeo(sk, flags & O_NONBLOCK);
-		rc = wait_event_interruptible_timeout(tc->wait,
-						      tc->pending_req_id == 0 || tc->closing ||
-						      !trustcore_net_ready(),
-						      timeout);
-		if (rc <= 0) {
+		wait_rc = wait_event_interruptible_timeout(tc->wait,
+							   tc->pending_req_id == 0 || tc->closing ||
+							   !trustcore_net_ready(),
+							   timeout);
+		if (wait_rc <= 0) {
 			tc_unregister_request(tc);
 			tc->peer_len = 0;
-			return rc == 0 ? -ETIMEDOUT : rc;
+			return wait_rc == 0 ? -ETIMEDOUT : (int)wait_rc;
 		}
 		if (!trustcore_net_ready()) {
 			if (tc->pending_req_id)
@@ -1017,14 +1019,14 @@ static int trustcore_connect(struct socket *sock, struct sockaddr *addr,
 		return -EINPROGRESS;
 
 	timeout = sock_sndtimeo(sk, flags & O_NONBLOCK);
-	rc = wait_event_interruptible_timeout(tc->wait,
-					      tc->pending_req_id == 0 || tc->closing ||
-					      !trustcore_net_ready(),
-					      timeout);
-	if (rc <= 0) {
+	wait_rc = wait_event_interruptible_timeout(tc->wait,
+						   tc->pending_req_id == 0 || tc->closing ||
+						   !trustcore_net_ready(),
+						   timeout);
+	if (wait_rc <= 0) {
 		tc_unregister_request(tc);
 		tc->peer_len = 0;
-		return rc == 0 ? -ETIMEDOUT : rc;
+		return wait_rc == 0 ? -ETIMEDOUT : (int)wait_rc;
 	}
 	if (!trustcore_net_ready()) {
 		if (tc->pending_req_id)
@@ -1049,6 +1051,7 @@ static int trustcore_listen(struct socket *sock, int backlog)
 		struct sockaddr_storage sa;
 	} auxbuf;
 	long timeout;
+	long wait_rc;
 	int rc;
 
 	if (sock->type == SOCK_DGRAM)
@@ -1122,13 +1125,13 @@ static int trustcore_listen(struct socket *sock, int backlog)
 	}
 
 	timeout = sock_sndtimeo(sk, 0);
-	rc = wait_event_interruptible_timeout(tc->wait,
-					      tc->pending_req_id == 0 || tc->closing ||
-					      !trustcore_net_ready(),
-					      timeout);
-	if (rc <= 0) {
+	wait_rc = wait_event_interruptible_timeout(tc->wait,
+						   tc->pending_req_id == 0 || tc->closing ||
+						   !trustcore_net_ready(),
+						   timeout);
+	if (wait_rc <= 0) {
 		tc_unregister_request(tc);
-		return rc == 0 ? -ETIMEDOUT : rc;
+		return wait_rc == 0 ? -ETIMEDOUT : (int)wait_rc;
 	}
 	if (!trustcore_net_ready()) {
 		if (tc->pending_req_id)
@@ -1150,7 +1153,7 @@ static int trustcore_accept(struct socket *sock, struct socket *newsock,
 	struct tc_sock *child;
 	bool nonblock = arg->flags & O_NONBLOCK;
 	long timeout;
-	int rc;
+	long wait_rc;
 
 	if (sock->type == SOCK_DGRAM)
 		return -EOPNOTSUPP;
@@ -1172,11 +1175,11 @@ static int trustcore_accept(struct socket *sock, struct socket *newsock,
 			return -EAGAIN;
 
 		timeout = sock_rcvtimeo(sk, arg->flags & O_NONBLOCK);
-		rc = wait_event_interruptible_timeout(listener->wait,
-						      !list_empty(&listener->accept_queue) || listener->closing,
-						      timeout);
-		if (rc <= 0)
-			return rc == 0 ? -ETIMEDOUT : rc;
+		wait_rc = wait_event_interruptible_timeout(listener->wait,
+							   !list_empty(&listener->accept_queue) || listener->closing,
+							   timeout);
+		if (wait_rc <= 0)
+			return wait_rc == 0 ? -ETIMEDOUT : (int)wait_rc;
 	}
 
 	newsk = sk_alloc(sock_net(sk), sock->ops->family, GFP_KERNEL, &trustcore_proto, arg->kern);
@@ -1615,6 +1618,7 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 	struct tc_rx_buf *buf;
 	size_t copied = 0;
 	long timeout;
+	long wait_rc;
 	int rc;
 
 	if (sock->type == SOCK_DGRAM) {
@@ -1641,11 +1645,11 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 				return -EAGAIN;
 
 			timeout = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
-			rc = wait_event_interruptible_timeout(tc->wait,
-							      !list_empty(&tc->rx_queue) || tc->closing,
-							      timeout);
-			if (rc <= 0)
-				return rc == 0 ? -ETIMEDOUT : rc;
+			wait_rc = wait_event_interruptible_timeout(tc->wait,
+								   !list_empty(&tc->rx_queue) || tc->closing,
+								   timeout);
+			if (wait_rc <= 0)
+				return wait_rc == 0 ? -ETIMEDOUT : (int)wait_rc;
 			if (tc->closing)
 				return 0;
 		}
@@ -1700,11 +1704,11 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 			return -EAGAIN;
 
 		timeout = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
-		rc = wait_event_interruptible_timeout(tc->wait,
-						      !list_empty(&tc->rx_queue) || tc->closing,
-						      timeout);
-		if (rc <= 0)
-			return rc == 0 ? -ETIMEDOUT : rc;
+		wait_rc = wait_event_interruptible_timeout(tc->wait,
+							   !list_empty(&tc->rx_queue) || tc->closing,
+							   timeout);
+		if (wait_rc <= 0)
+			return wait_rc == 0 ? -ETIMEDOUT : (int)wait_rc;
 		if (tc->closing)
 			return 0;
 	}
