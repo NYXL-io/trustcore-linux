@@ -240,9 +240,6 @@ int main(void)
 	{
 		int sret = set_intercept_mode();
 
-		if (sret)
-			fprintf(stderr, "trustcore_net: unable to set intercept mode: %s\n",
-				strerror(-sret));
 		intercept_rc = sret;
 	}
 

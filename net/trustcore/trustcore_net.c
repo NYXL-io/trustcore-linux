@@ -596,15 +596,11 @@ int trustcore_net_send_desc(struct tc_net_desc *desc,
 	int rc;
 
 	if (!trustcore_net_ready()) {
-		pr_err("trustcore_net: send_desc net not ready type=%u stream=%llu req=%llu\n",
-		       desc->type, desc->stream_id, desc->req_id);
 		return -ENETDOWN;
 	}
 
 	rc = tc_ring_push(&tc_ctx.ring_out, desc, data, data_len, aux, aux_len, nonblock);
 	if (rc) {
-		pr_err("trustcore_net: send_desc push rc=%d type=%u stream=%llu req=%llu data_len=%u aux_len=%u\n",
-		       rc, desc->type, desc->stream_id, desc->req_id, data_len, aux_len);
 		return rc;
 	}
 
@@ -625,8 +621,6 @@ int trustcore_net_send_desc_iter(struct tc_net_desc *desc,
 	u32 needed = data_len + aux_len;
 
 	if (!trustcore_net_ready()) {
-		pr_err("trustcore_net: send_desc_iter net not ready type=%u stream=%llu req=%llu\n",
-		       desc->type, desc->stream_id, desc->req_id);
 		return -ENETDOWN;
 	}
 
@@ -644,8 +638,6 @@ int trustcore_net_send_desc_iter(struct tc_net_desc *desc,
 			continue;
 		}
 		if (rc) {
-			pr_err("trustcore_net: send_desc_iter push rc=%d type=%u stream=%llu req=%llu data_len=%u aux_len=%u\n",
-			       rc, desc->type, desc->stream_id, desc->req_id, data_len, aux_len);
 			return rc;
 		}
 		break;

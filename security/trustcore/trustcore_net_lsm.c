@@ -8,24 +8,8 @@
 #include <linux/sched.h>
 #include <linux/socket.h>
 
-static void trustcore_net_log_deny(int family, int type, int protocol)
-{
-	uid_t uid = from_kuid_munged(current_user_ns(), current_uid());
-	gid_t gid = from_kgid_munged(current_user_ns(), current_gid());
-
-	pr_err("trustcore_net: denied socket family=%d type=%d proto=%d tgid=%u uid=%u gid=%u\n",
-	       family, type, protocol, current->tgid, uid, gid);
-	dump_stack();
-}
-
 static int trustcore_net_socket_create(int family, int type, int protocol, int kern)
 {
-	uid_t uid = from_kuid_munged(current_user_ns(), current_uid());
-	gid_t gid = from_kgid_munged(current_user_ns(), current_gid());
-
-	pr_info("trustcore_net: socket_create family=%d type=%d proto=%d kern=%d tgid=%u uid=%u gid=%u comm=%s\n",
-		family, type, protocol, kern, current->tgid, uid, gid, current->comm);
-
 	if (kern)
 		return 0;
 
@@ -39,7 +23,6 @@ static int trustcore_net_socket_create(int family, int type, int protocol, int k
 			if (protocol == NETLINK_ROUTE || protocol == NETLINK_GENERIC)
 				return 0;
 		}
-		trustcore_net_log_deny(family, type, protocol);
 		return -EPERM;
 	}
 
@@ -49,20 +32,16 @@ static int trustcore_net_socket_create(int family, int type, int protocol, int k
 		if (sock_type == SOCK_STREAM) {
 			if (protocol == 0 || protocol == IPPROTO_TCP)
 				return 0;
-			trustcore_net_log_deny(family, type, protocol);
 			return -EPERM;
 		}
 		if (sock_type == SOCK_DGRAM) {
 			if (protocol == 0 || protocol == IPPROTO_UDP)
 				return 0;
-			trustcore_net_log_deny(family, type, protocol);
 			return -EPERM;
 		}
-		trustcore_net_log_deny(family, type, protocol);
 		return -EPERM;
 	}
 
-	trustcore_net_log_deny(family, type, protocol);
 	return -EPERM;
 }
 
