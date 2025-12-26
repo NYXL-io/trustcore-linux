@@ -13,6 +13,8 @@
 #include <linux/ipv6.h>
 #include <linux/mm.h>
 #include <linux/limits.h>
+#include <linux/printk.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/socket.h>
 #include <linux/skbuff.h>
@@ -657,23 +659,40 @@ static int trustcore_bind(struct socket *sock, struct sockaddr *addr, int addr_l
 {
 	struct tc_sock *tc = tc_sk(sock->sk);
 
-	if (addr_len < sizeof(sa_family_t))
+	if (addr_len < sizeof(sa_family_t)) {
+		pr_err("trustcore_net: bind invalid addr_len=%d tgid=%u comm=%s\n",
+		       addr_len, current->tgid, current->comm);
 		return -EINVAL;
+	}
 	if (sock->ops->family == PF_INET) {
 		if (addr->sa_family != AF_INET ||
-		    addr_len != sizeof(struct sockaddr_in))
+		    addr_len != sizeof(struct sockaddr_in)) {
+			pr_err("trustcore_net: bind invalid inet addr_family=%d addr_len=%d tgid=%u comm=%s\n",
+			       addr->sa_family, addr_len, current->tgid, current->comm);
 			return -EINVAL;
+		}
 	} else if (sock->ops->family == PF_INET6) {
 		if (addr->sa_family != AF_INET6 ||
-		    addr_len != sizeof(struct sockaddr_in6))
+		    addr_len != sizeof(struct sockaddr_in6)) {
+			pr_err("trustcore_net: bind invalid inet6 addr_family=%d addr_len=%d tgid=%u comm=%s\n",
+			       addr->sa_family, addr_len, current->tgid, current->comm);
 			return -EINVAL;
+		}
 	} else {
+		pr_err("trustcore_net: bind unsupported family=%d addr_family=%d tgid=%u comm=%s\n",
+		       sock->ops->family, addr->sa_family, current->tgid, current->comm);
 		return -EINVAL;
 	}
 	memcpy(&tc->local, addr, addr_len);
 	tc->local_len = addr_len;
-	if (sock->type == SOCK_DGRAM && trustcore_net_ready())
-		return trustcore_dgram_bind_host(sock, false);
+	if (sock->type == SOCK_DGRAM && trustcore_net_ready()) {
+		int rc = trustcore_dgram_bind_host(sock, false);
+		if (rc) {
+			pr_err("trustcore_net: bind dgram_host failed rc=%d tgid=%u comm=%s\n",
+			       rc, current->tgid, current->comm);
+		}
+		return rc;
+	}
 	return 0;
 }
 
@@ -721,8 +740,11 @@ static int trustcore_dgram_bind_host(struct socket *sock, bool nonblock)
 
 	if (tc->dgram_host_ready)
 		return 0;
-	if (!trustcore_net_ready())
+	if (!trustcore_net_ready()) {
+		pr_err("trustcore_net: dgram_bind_host net not ready tgid=%u comm=%s\n",
+		       current->tgid, current->comm);
 		return -ENETDOWN;
+	}
 	if (tc->pending_req_id) {
 		if (nonblock)
 			return -EAGAIN;
@@ -731,12 +753,18 @@ static int trustcore_dgram_bind_host(struct socket *sock, bool nonblock)
 						      tc->pending_req_id == 0 || tc->closing ||
 						      !trustcore_net_ready(),
 						      timeout);
-		if (rc <= 0)
+		if (rc <= 0) {
+			pr_err("trustcore_net: dgram_bind_host wait rc=%ld tgid=%u comm=%s\n",
+			       rc, current->tgid, current->comm);
 			return rc == 0 ? -ETIMEDOUT : rc;
+		}
 		if (!trustcore_net_ready())
 			return -ENETDOWN;
-		if (tc->pending_status)
+		if (tc->pending_status) {
+			pr_err("trustcore_net: dgram_bind_host pending_status=%d tgid=%u comm=%s\n",
+			       tc->pending_status, current->tgid, current->comm);
 			return -tc->pending_status;
+		}
 		return tc->dgram_host_ready ? 0 : -EIO;
 	}
 
@@ -766,6 +794,8 @@ static int trustcore_dgram_bind_host(struct socket *sock, bool nonblock)
 				     sizeof(auxbuf.origin) + tc->local_len,
 				     nonblock);
 	if (rc) {
+		pr_err("trustcore_net: dgram_bind_host send_desc rc=%d tgid=%u comm=%s\n",
+		       rc, current->tgid, current->comm);
 		tc_unregister_request(tc);
 		return rc;
 	}
@@ -779,6 +809,8 @@ static int trustcore_dgram_bind_host(struct socket *sock, bool nonblock)
 					      !trustcore_net_ready(),
 					      timeout);
 	if (rc <= 0) {
+		pr_err("trustcore_net: dgram_bind_host wait2 rc=%ld tgid=%u comm=%s\n",
+		       rc, current->tgid, current->comm);
 		tc_unregister_request(tc);
 		return rc == 0 ? -ETIMEDOUT : rc;
 	}
@@ -787,8 +819,11 @@ static int trustcore_dgram_bind_host(struct socket *sock, bool nonblock)
 			tc_unregister_request(tc);
 		return -ENETDOWN;
 	}
-	if (tc->pending_status)
+	if (tc->pending_status) {
+		pr_err("trustcore_net: dgram_bind_host pending_status2=%d tgid=%u comm=%s\n",
+		       tc->pending_status, current->tgid, current->comm);
 		return -tc->pending_status;
+	}
 	return tc->dgram_host_ready ? 0 : -EIO;
 }
 
@@ -1400,32 +1435,49 @@ static int trustcore_sendmsg(struct socket *sock, struct msghdr *msg, size_t len
 		u32 daddr_len = 0;
 		u32 max_payload;
 
-		if (!trustcore_net_ready())
+		if (!trustcore_net_ready()) {
+			pr_err("trustcore_net: sendmsg dgram net not ready tgid=%u comm=%s\n",
+			       current->tgid, current->comm);
 			return -ENETDOWN;
+		}
 		if (!len)
 			return 0;
 
 		if (msg->msg_name && msg->msg_namelen) {
 			const struct sockaddr *sa = msg->msg_name;
 
-			if (msg->msg_namelen < sizeof(sa_family_t))
+			if (msg->msg_namelen < sizeof(sa_family_t)) {
+				pr_err("trustcore_net: sendmsg dgram invalid namelen=%u tgid=%u comm=%s\n",
+				       msg->msg_namelen, current->tgid, current->comm);
 				return -EINVAL;
+			}
 			if (sock->ops->family == PF_INET) {
 				if (sa->sa_family != AF_INET ||
-				    msg->msg_namelen != sizeof(struct sockaddr_in))
+				    msg->msg_namelen != sizeof(struct sockaddr_in)) {
+					pr_err("trustcore_net: sendmsg dgram inet addr_family=%d namelen=%u tgid=%u comm=%s\n",
+					       sa->sa_family, msg->msg_namelen, current->tgid, current->comm);
 					return -EINVAL;
+				}
 			} else if (sock->ops->family == PF_INET6) {
 				if (sa->sa_family != AF_INET6 ||
-				    msg->msg_namelen != sizeof(struct sockaddr_in6))
+				    msg->msg_namelen != sizeof(struct sockaddr_in6)) {
+					pr_err("trustcore_net: sendmsg dgram inet6 addr_family=%d namelen=%u tgid=%u comm=%s\n",
+					       sa->sa_family, msg->msg_namelen, current->tgid, current->comm);
 					return -EINVAL;
+				}
 			} else {
+				pr_err("trustcore_net: sendmsg dgram unsupported family=%d tgid=%u comm=%s\n",
+				       sock->ops->family, current->tgid, current->comm);
 				return -EINVAL;
 			}
 			daddr = sa;
 			daddr_len = msg->msg_namelen;
 		} else {
-			if (!tc->dgram_connected || !tc->peer_len)
+			if (!tc->dgram_connected || !tc->peer_len) {
+				pr_err("trustcore_net: sendmsg dgram not connected tgid=%u comm=%s\n",
+				       current->tgid, current->comm);
 				return -ENOTCONN;
+			}
 		}
 
 		if (!tc->stream_id)
@@ -1433,15 +1485,24 @@ static int trustcore_sendmsg(struct socket *sock, struct msghdr *msg, size_t len
 
 		if (!tc->dgram_host_ready) {
 			rc = trustcore_dgram_bind_host(sock, nonblock);
-			if (rc)
+			if (rc) {
+				pr_err("trustcore_net: sendmsg dgram bind_host rc=%d tgid=%u comm=%s\n",
+				       rc, current->tgid, current->comm);
 				return rc == -ENOSPC ? -EAGAIN : rc;
+			}
 		}
 
 		max_payload = trustcore_net_max_payload();
-		if (!max_payload)
+		if (!max_payload) {
+			pr_err("trustcore_net: sendmsg dgram max_payload=0 tgid=%u comm=%s\n",
+			       current->tgid, current->comm);
 			return -ENETDOWN;
-		if (len > max_payload)
+		}
+		if (len > max_payload) {
+			pr_err("trustcore_net: sendmsg dgram msg too large len=%zu max=%u tgid=%u comm=%s\n",
+			       len, max_payload, current->tgid, current->comm);
 			return -EMSGSIZE;
+		}
 
 		{
 			struct tc_net_desc desc = {};
@@ -1456,6 +1517,8 @@ static int trustcore_sendmsg(struct socket *sock, struct msghdr *msg, size_t len
 							  daddr, daddr_len,
 							  nonblock);
 			if (rc) {
+				pr_err("trustcore_net: sendmsg dgram send_desc rc=%d tgid=%u comm=%s\n",
+				       rc, current->tgid, current->comm);
 				if (rc == -ENOSPC)
 					rc = -EAGAIN;
 				return rc;
