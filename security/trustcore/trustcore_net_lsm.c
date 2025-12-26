@@ -20,6 +20,12 @@ static void trustcore_net_log_deny(int family, int type, int protocol)
 
 static int trustcore_net_socket_create(int family, int type, int protocol, int kern)
 {
+	uid_t uid = from_kuid_munged(current_user_ns(), current_uid());
+	gid_t gid = from_kgid_munged(current_user_ns(), current_gid());
+
+	pr_info("trustcore_net: socket_create family=%d type=%d proto=%d kern=%d tgid=%u uid=%u gid=%u comm=%s\n",
+		family, type, protocol, kern, current->tgid, uid, gid, current->comm);
+
 	if (kern)
 		return 0;
 
