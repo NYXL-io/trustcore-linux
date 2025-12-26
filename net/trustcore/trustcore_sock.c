@@ -754,7 +754,7 @@ static int trustcore_dgram_bind_host(struct socket *sock, bool nonblock)
 						      !trustcore_net_ready(),
 						      timeout);
 		if (rc <= 0) {
-			pr_err("trustcore_net: dgram_bind_host wait rc=%ld tgid=%u comm=%s\n",
+			pr_err("trustcore_net: dgram_bind_host wait rc=%d tgid=%u comm=%s\n",
 			       rc, current->tgid, current->comm);
 			return rc == 0 ? -ETIMEDOUT : rc;
 		}
@@ -809,7 +809,7 @@ static int trustcore_dgram_bind_host(struct socket *sock, bool nonblock)
 					      !trustcore_net_ready(),
 					      timeout);
 	if (rc <= 0) {
-		pr_err("trustcore_net: dgram_bind_host wait2 rc=%ld tgid=%u comm=%s\n",
+		pr_err("trustcore_net: dgram_bind_host wait2 rc=%d tgid=%u comm=%s\n",
 		       rc, current->tgid, current->comm);
 		tc_unregister_request(tc);
 		return rc == 0 ? -ETIMEDOUT : rc;
