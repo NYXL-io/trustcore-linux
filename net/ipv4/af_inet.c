@@ -323,6 +323,8 @@ lookup_protocol:
 	answer_flags = answer->flags;
 #ifdef CONFIG_TRUSTCORE_NET
 	if (trustcore_net_should_intercept(sock->type, protocol)) {
+		pr_info("trustcore_net: inet_create intercept type=%d proto=%d kern=%d tgid=%u comm=%s\n",
+			sock->type, protocol, kern, current->tgid, current->comm);
 		sock->ops = &trustcore_inet_ops;
 		answer_prot = &trustcore_proto;
 		answer_flags = 0;

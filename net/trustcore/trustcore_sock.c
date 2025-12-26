@@ -81,6 +81,32 @@ struct tc_sock {
 	struct hlist_node req_node;
 };
 
+static void trustcore_log_sockaddr(const char *label, const struct sockaddr *sa, u32 len)
+{
+	if (!sa || len < sizeof(sa_family_t)) {
+		pr_info("trustcore_net: %s <none>\n", label);
+		return;
+	}
+
+	if (sa->sa_family == AF_INET && len >= sizeof(struct sockaddr_in)) {
+		const struct sockaddr_in *sin = (const struct sockaddr_in *)sa;
+
+		pr_info("trustcore_net: %s inet %pI4:%u\n", label, &sin->sin_addr.s_addr,
+			ntohs(sin->sin_port));
+		return;
+	}
+#if IS_ENABLED(CONFIG_IPV6)
+	if (sa->sa_family == AF_INET6 && len >= sizeof(struct sockaddr_in6)) {
+		const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)sa;
+
+		pr_info("trustcore_net: %s inet6 %pI6:%u\n", label, &sin6->sin6_addr,
+			ntohs(sin6->sin6_port));
+		return;
+	}
+#endif
+	pr_info("trustcore_net: %s family=%d len=%u\n", label, sa->sa_family, len);
+}
+
 static DEFINE_HASHTABLE(tc_streams, 10);
 static DEFINE_HASHTABLE(tc_listeners, 10);
 static DEFINE_HASHTABLE(tc_requests, 10);
@@ -423,6 +449,12 @@ static void tc_handle_inbound(const struct tc_net_desc *desc,
 			return;
 		}
 		tc = tc_sk(sk);
+		pr_info("trustcore_net: dgram_bind_resp req=%llu status=%u stream=%llu aux_len=%u\n",
+			(unsigned long long)desc->req_id, desc->status,
+			(unsigned long long)desc->stream_id, aux_len);
+		if (desc->status == 0 && tc_local_sockaddr_valid(sk, aux, aux_len))
+			trustcore_log_sockaddr("dgram_bind_resp local",
+					       (const struct sockaddr *)aux, aux_len);
 		if (desc->status == 0) {
 			if (desc->stream_id && desc->stream_id != tc->stream_id)
 				tc->stream_id = desc->stream_id;
@@ -448,6 +480,12 @@ static void tc_handle_inbound(const struct tc_net_desc *desc,
 			return;
 		}
 		tc = tc_sk(sk);
+		pr_info("trustcore_net: dgram_connect_resp req=%llu status=%u stream=%llu aux_len=%u\n",
+			(unsigned long long)desc->req_id, desc->status,
+			(unsigned long long)desc->stream_id, aux_len);
+		if (desc->status == 0 && tc_local_sockaddr_valid(sk, aux, aux_len))
+			trustcore_log_sockaddr("dgram_connect_resp local",
+					       (const struct sockaddr *)aux, aux_len);
 		if (desc->status == 0) {
 			if (desc->stream_id && desc->stream_id != tc->stream_id)
 				tc->stream_id = desc->stream_id;
@@ -788,6 +826,12 @@ static int trustcore_dgram_bind_host(struct socket *sock, bool nonblock)
 	auxbuf.origin.reserved = 0;
 	memset(&auxbuf.sa, 0, sizeof(auxbuf.sa));
 	memcpy(&auxbuf.sa, &tc->local, tc->local_len);
+
+	pr_info("trustcore_net: dgram_bind_host send req=%llu stream=%llu tgid=%u comm=%s\n",
+		(unsigned long long)desc.req_id, (unsigned long long)desc.stream_id,
+		current->tgid, current->comm);
+	trustcore_log_sockaddr("dgram_bind_host local", (struct sockaddr *)&tc->local,
+			       tc->local_len);
 
 	tc_register_request(tc, desc.req_id);
 	rc = trustcore_net_send_desc(&desc, NULL, 0, &auxbuf,
@@ -1483,6 +1527,12 @@ static int trustcore_sendmsg(struct socket *sock, struct msghdr *msg, size_t len
 		if (!tc->stream_id)
 			tc->stream_id = atomic64_inc_return(&tc_next_stream_id);
 
+		pr_info("trustcore_net: dgram_send len=%zu stream=%llu tgid=%u comm=%s\n",
+			len, (unsigned long long)tc->stream_id, current->tgid, current->comm);
+		trustcore_log_sockaddr("dgram_send dest",
+				       daddr ? daddr : (const struct sockaddr *)&tc->peer,
+				       daddr ? daddr_len : tc->peer_len);
+
 		if (!tc->dgram_host_ready) {
 			rc = trustcore_dgram_bind_host(sock, nonblock);
 			if (rc) {
@@ -1762,35 +1812,47 @@ bool trustcore_net_should_intercept(int sock_type, int protocol)
 	int mode = READ_ONCE(trustcore_intercept_mode);
 	uid_t uid;
 	gid_t gid;
+	bool intercept = false;
 
 	if (sock_type == SOCK_STREAM) {
 		if (protocol != 0 && protocol != IPPROTO_TCP)
-			return false;
+			goto out_log;
 	} else if (sock_type == SOCK_DGRAM) {
 		if (protocol != 0 && protocol != IPPROTO_UDP)
-			return false;
+			goto out_log;
 	} else {
-		return false;
+		goto out_log;
 	}
 
 	/* Fail-closed: intercept even when control plane is not ready. */
 	switch (mode) {
 	case TRUSTCORE_INTERCEPT_ON:
-		return true;
+		intercept = true;
+		break;
 	case TRUSTCORE_INTERCEPT_UID:
 		if (trustcore_intercept_uid < 0)
-			return false;
+			break;
 		uid = from_kuid_munged(current_user_ns(), current_uid());
-		return uid == (uid_t)trustcore_intercept_uid;
+		intercept = uid == (uid_t)trustcore_intercept_uid;
+		break;
 	case TRUSTCORE_INTERCEPT_GID:
 		if (trustcore_intercept_gid < 0)
-			return false;
+			break;
 		gid = from_kgid_munged(current_user_ns(), current_gid());
-		return gid == (gid_t)trustcore_intercept_gid;
+		intercept = gid == (gid_t)trustcore_intercept_gid;
+		break;
 	case TRUSTCORE_INTERCEPT_OFF:
 	default:
-		return false;
+		break;
 	}
+
+out_log:
+	uid = from_kuid_munged(current_user_ns(), current_uid());
+	gid = from_kgid_munged(current_user_ns(), current_gid());
+	pr_info("trustcore_net: intercept %s mode=%d type=%d proto=%d tgid=%u uid=%u gid=%u comm=%s\n",
+		intercept ? "on" : "off", mode, sock_type, protocol,
+		current->tgid, uid, gid, current->comm);
+	return intercept;
 }
 EXPORT_SYMBOL_GPL(trustcore_net_should_intercept);
 
