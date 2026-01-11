@@ -769,6 +769,7 @@ static long tc_device_ioctl(struct file *file, unsigned int cmd, unsigned long a
 	struct tc_net_config cfg;
 	struct tc_net_layout layout;
 	struct tc_net_eventfds ev;
+	struct tc_net_cgroup_req cg;
 	int rc = 0;
 
 	mutex_lock(&tc_ctx.lock);
@@ -876,6 +877,29 @@ static long tc_device_ioctl(struct file *file, unsigned int cmd, unsigned long a
 	case TC_NET_IOC_KICK:
 		wake_up_interruptible(&tc_ctx.ring_in.wait);
 		wake_up_interruptible(&tc_ctx.ring_out.wait);
+		break;
+	case TC_NET_IOC_CGROUP:
+		if (copy_from_user(&cg, (void __user *)arg, sizeof(cg))) {
+			rc = -EFAULT;
+			break;
+		}
+		switch (cg.op) {
+		case TC_NET_CGROUP_ADD:
+			rc = trustcore_net_cgroup_add(cg.fd, &cg.cgroup_id);
+			break;
+		case TC_NET_CGROUP_DEL:
+			rc = trustcore_net_cgroup_del(cg.cgroup_id);
+			break;
+		case TC_NET_CGROUP_CLEAR:
+			trustcore_net_cgroup_clear();
+			rc = 0;
+			break;
+		default:
+			rc = -EINVAL;
+			break;
+		}
+		if (!rc && copy_to_user((void __user *)arg, &cg, sizeof(cg)))
+			rc = -EFAULT;
 		break;
 	default:
 		rc = -ENOIOCTLCMD;

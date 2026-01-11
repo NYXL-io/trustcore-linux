@@ -19,6 +19,7 @@
 #include <linux/socket.h>
 #include <linux/skbuff.h>
 #include <linux/uio.h>
+#include <linux/cgroup.h>
 #include <linux/seq_file.h>
 #include <net/inet_common.h>
 #include <net/inet_sock.h>
@@ -35,6 +36,7 @@
 #define TRUSTCORE_INTERCEPT_ON 1
 #define TRUSTCORE_INTERCEPT_UID 2
 #define TRUSTCORE_INTERCEPT_GID 3
+#define TRUSTCORE_INTERCEPT_CGROUP 4
 
 struct tc_rx_buf {
 	struct list_head list;
@@ -98,11 +100,20 @@ static int trustcore_intercept_uid = -1;
 static int trustcore_intercept_gid = -1;
 
 module_param(trustcore_intercept_mode, int, 0644);
-MODULE_PARM_DESC(trustcore_intercept_mode, "0=off 1=on 2=uid 3=gid");
+MODULE_PARM_DESC(trustcore_intercept_mode, "0=off 1=on 2=uid 3=gid 4=cgroup");
 module_param(trustcore_intercept_uid, int, 0644);
 MODULE_PARM_DESC(trustcore_intercept_uid, "Intercept only for matching UID (mode=2)");
 module_param(trustcore_intercept_gid, int, 0644);
 MODULE_PARM_DESC(trustcore_intercept_gid, "Intercept only for matching GID (mode=3)");
+
+struct tc_cgroup_entry {
+	struct list_head list;
+	struct cgroup *cgrp;
+	u64 id;
+};
+
+static LIST_HEAD(tc_cgroup_list);
+static DEFINE_MUTEX(tc_cgroup_lock);
 
 #ifdef CONFIG_DEBUG_FS
 static struct dentry *tc_sock_debugfs_dir;
@@ -1717,6 +1728,109 @@ static void trustcore_proto_close(struct sock *sk, long timeout)
 	sk_common_release(sk);
 }
 
+static bool trustcore_net_cgroup_match(struct task_struct *task)
+{
+	struct cgroup *task_cgrp;
+	struct tc_cgroup_entry *entry;
+	bool matched = false;
+
+	rcu_read_lock();
+	task_cgrp = task_dfl_cgroup(task);
+	if (!task_cgrp) {
+		rcu_read_unlock();
+		return false;
+	}
+
+	mutex_lock(&tc_cgroup_lock);
+	list_for_each_entry(entry, &tc_cgroup_list, list) {
+		if (cgroup_is_descendant(task_cgrp, entry->cgrp)) {
+			matched = true;
+			break;
+		}
+	}
+	mutex_unlock(&tc_cgroup_lock);
+	rcu_read_unlock();
+	return matched;
+}
+
+int trustcore_net_cgroup_add(int fd, u64 *out_id)
+{
+	struct cgroup *cgrp;
+	struct tc_cgroup_entry *entry;
+	u64 id;
+
+	if (fd < 0)
+		return -EINVAL;
+
+	cgrp = cgroup_get_from_fd(fd);
+	if (IS_ERR(cgrp))
+		return PTR_ERR(cgrp);
+
+	id = cgroup_id(cgrp);
+
+	mutex_lock(&tc_cgroup_lock);
+	list_for_each_entry(entry, &tc_cgroup_list, list) {
+		if (entry->id == id) {
+			mutex_unlock(&tc_cgroup_lock);
+			if (out_id)
+				*out_id = id;
+			cgroup_put(cgrp);
+			return 0;
+		}
+	}
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry) {
+		mutex_unlock(&tc_cgroup_lock);
+		cgroup_put(cgrp);
+		return -ENOMEM;
+	}
+	entry->cgrp = cgrp;
+	entry->id = id;
+	list_add_tail(&entry->list, &tc_cgroup_list);
+	mutex_unlock(&tc_cgroup_lock);
+
+	if (out_id)
+		*out_id = id;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(trustcore_net_cgroup_add);
+
+int trustcore_net_cgroup_del(u64 cgroup_id)
+{
+	struct tc_cgroup_entry *entry;
+	struct tc_cgroup_entry *tmp;
+	int rc = -ENOENT;
+
+	mutex_lock(&tc_cgroup_lock);
+	list_for_each_entry_safe(entry, tmp, &tc_cgroup_list, list) {
+		if (entry->id == cgroup_id) {
+			list_del(&entry->list);
+			cgroup_put(entry->cgrp);
+			kfree(entry);
+			rc = 0;
+			break;
+		}
+	}
+	mutex_unlock(&tc_cgroup_lock);
+	return rc;
+}
+EXPORT_SYMBOL_GPL(trustcore_net_cgroup_del);
+
+void trustcore_net_cgroup_clear(void)
+{
+	struct tc_cgroup_entry *entry;
+	struct tc_cgroup_entry *tmp;
+
+	mutex_lock(&tc_cgroup_lock);
+	list_for_each_entry_safe(entry, tmp, &tc_cgroup_list, list) {
+		list_del(&entry->list);
+		cgroup_put(entry->cgrp);
+		kfree(entry);
+	}
+	mutex_unlock(&tc_cgroup_lock);
+}
+EXPORT_SYMBOL_GPL(trustcore_net_cgroup_clear);
+
 bool trustcore_net_should_intercept(int sock_type, int protocol)
 {
 	int mode = READ_ONCE(trustcore_intercept_mode);
@@ -1747,6 +1861,8 @@ bool trustcore_net_should_intercept(int sock_type, int protocol)
 			return false;
 		gid = from_kgid_munged(current_user_ns(), current_gid());
 		return gid == (gid_t)trustcore_intercept_gid;
+	case TRUSTCORE_INTERCEPT_CGROUP:
+		return trustcore_net_cgroup_match(current);
 	case TRUSTCORE_INTERCEPT_OFF:
 	default:
 		return false;
@@ -1848,6 +1964,7 @@ static void __exit trustcore_sock_exit(void)
 	debugfs_remove_recursive(tc_sock_debugfs_dir);
 	tc_sock_debugfs_dir = NULL;
 #endif
+	trustcore_net_cgroup_clear();
 	proto_unregister(&trustcore_proto);
 }
 

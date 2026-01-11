@@ -144,6 +144,20 @@ struct tc_net_eventfds {
 	__u32 reserved;
 };
 
+enum tc_net_cgroup_op {
+	TC_NET_CGROUP_ADD = 1,
+	TC_NET_CGROUP_DEL = 2,
+	TC_NET_CGROUP_CLEAR = 3,
+};
+
+struct tc_net_cgroup_req {
+	__u32 op;
+	__u32 flags;
+	__s32 fd;
+	__u32 reserved;
+	__u64 cgroup_id;
+};
+
 #define TC_NET_IOC_MAGIC 'T'
 
 #define TC_NET_IOC_VERSION _IOWR(TC_NET_IOC_MAGIC, 0x00, struct tc_net_version)
@@ -151,5 +165,6 @@ struct tc_net_eventfds {
 #define TC_NET_IOC_LAYOUT  _IOR(TC_NET_IOC_MAGIC, 0x02, struct tc_net_layout)
 #define TC_NET_IOC_EVENTFD _IOW(TC_NET_IOC_MAGIC, 0x03, struct tc_net_eventfds)
 #define TC_NET_IOC_KICK    _IO(TC_NET_IOC_MAGIC, 0x04)
+#define TC_NET_IOC_CGROUP  _IOWR(TC_NET_IOC_MAGIC, 0x05, struct tc_net_cgroup_req)
 
 #endif /* _UAPI_LINUX_TRUSTCORE_NET_H */

@@ -32,5 +32,8 @@ int trustcore_sock_deliver_recv(u64 stream_id, const void *data, u32 len);
 int trustcore_sock_deliver_recv_from(u64 stream_id, const void *data, u32 len,
 				     const void *addr, u32 addr_len);
 void trustcore_sock_abort_all(int err);
+int trustcore_net_cgroup_add(int fd, u64 *out_id);
+int trustcore_net_cgroup_del(u64 cgroup_id);
+void trustcore_net_cgroup_clear(void);
 
 #endif /* _NET_TRUSTCORE_INTERNAL_H */
