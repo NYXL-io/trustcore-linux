@@ -742,6 +742,16 @@ static int tc_device_release(struct inode *inode, struct file *file)
 	mutex_lock(&tc_ctx.lock);
 	tc_ctx.open = false;
 	WRITE_ONCE(tc_ctx.configured, false);
+	{
+		struct tc_net_intercept_req req = {
+			.mode = TC_NET_INTERCEPT_OFF,
+			.uid = -1,
+			.gid = -1,
+			.flags = 0,
+		};
+		trustcore_net_set_intercept(&req);
+		trustcore_net_cgroup_clear();
+	}
 	wake_up_all(&tc_ctx.ring_out.wait);
 	wake_up_all(&tc_ctx.ring_in.wait);
 	trustcore_sock_abort_all(ENETDOWN);
@@ -770,6 +780,7 @@ static long tc_device_ioctl(struct file *file, unsigned int cmd, unsigned long a
 	struct tc_net_layout layout;
 	struct tc_net_eventfds ev;
 	struct tc_net_cgroup_req cg;
+	struct tc_net_intercept_req ic;
 	int rc = 0;
 
 	mutex_lock(&tc_ctx.lock);
@@ -899,6 +910,22 @@ static long tc_device_ioctl(struct file *file, unsigned int cmd, unsigned long a
 			break;
 		}
 		if (!rc && copy_to_user((void __user *)arg, &cg, sizeof(cg)))
+			rc = -EFAULT;
+		break;
+	case TC_NET_IOC_INTERCEPT:
+		if (copy_from_user(&ic, (void __user *)arg, sizeof(ic))) {
+			rc = -EFAULT;
+			break;
+		}
+		if (ic.flags & TC_NET_INTERCEPT_F_QUERY) {
+			trustcore_net_get_intercept(&ic);
+			rc = 0;
+		} else {
+			rc = trustcore_net_set_intercept(&ic);
+			if (!rc)
+				trustcore_net_get_intercept(&ic);
+		}
+		if (!rc && copy_to_user((void __user *)arg, &ic, sizeof(ic)))
 			rc = -EFAULT;
 		break;
 	default:

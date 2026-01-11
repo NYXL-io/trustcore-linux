@@ -35,5 +35,7 @@ void trustcore_sock_abort_all(int err);
 int trustcore_net_cgroup_add(int fd, u64 *out_id);
 int trustcore_net_cgroup_del(u64 cgroup_id);
 void trustcore_net_cgroup_clear(void);
+int trustcore_net_set_intercept(const struct tc_net_intercept_req *req);
+void trustcore_net_get_intercept(struct tc_net_intercept_req *req);
 
 #endif /* _NET_TRUSTCORE_INTERNAL_H */

@@ -32,11 +32,11 @@
 #define TRUSTCORE_TX_READY_MIN 1u
 #define TRUSTCORE_RX_MAX_BYTES (4u * 1024u * 1024u)
 #define TRUSTCORE_RX_MAX_BUFS 1024u
-#define TRUSTCORE_INTERCEPT_OFF 0
-#define TRUSTCORE_INTERCEPT_ON 1
-#define TRUSTCORE_INTERCEPT_UID 2
-#define TRUSTCORE_INTERCEPT_GID 3
-#define TRUSTCORE_INTERCEPT_CGROUP 4
+#define TRUSTCORE_INTERCEPT_OFF TC_NET_INTERCEPT_OFF
+#define TRUSTCORE_INTERCEPT_ON TC_NET_INTERCEPT_ON
+#define TRUSTCORE_INTERCEPT_UID TC_NET_INTERCEPT_UID
+#define TRUSTCORE_INTERCEPT_GID TC_NET_INTERCEPT_GID
+#define TRUSTCORE_INTERCEPT_CGROUP TC_NET_INTERCEPT_CGROUP
 
 struct tc_rx_buf {
 	struct list_head list;
@@ -1830,6 +1830,49 @@ void trustcore_net_cgroup_clear(void)
 	mutex_unlock(&tc_cgroup_lock);
 }
 EXPORT_SYMBOL_GPL(trustcore_net_cgroup_clear);
+
+int trustcore_net_set_intercept(const struct tc_net_intercept_req *req)
+{
+	if (!req)
+		return -EINVAL;
+
+	switch (req->mode) {
+	case TC_NET_INTERCEPT_OFF:
+	case TC_NET_INTERCEPT_ON:
+	case TC_NET_INTERCEPT_CGROUP:
+		WRITE_ONCE(trustcore_intercept_uid, -1);
+		WRITE_ONCE(trustcore_intercept_gid, -1);
+		break;
+	case TC_NET_INTERCEPT_UID:
+		if (req->uid < 0)
+			return -EINVAL;
+		WRITE_ONCE(trustcore_intercept_uid, req->uid);
+		WRITE_ONCE(trustcore_intercept_gid, -1);
+		break;
+	case TC_NET_INTERCEPT_GID:
+		if (req->gid < 0)
+			return -EINVAL;
+		WRITE_ONCE(trustcore_intercept_gid, req->gid);
+		WRITE_ONCE(trustcore_intercept_uid, -1);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(trustcore_intercept_mode, req->mode);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(trustcore_net_set_intercept);
+
+void trustcore_net_get_intercept(struct tc_net_intercept_req *req)
+{
+	if (!req)
+		return;
+	req->mode = READ_ONCE(trustcore_intercept_mode);
+	req->uid = READ_ONCE(trustcore_intercept_uid);
+	req->gid = READ_ONCE(trustcore_intercept_gid);
+}
+EXPORT_SYMBOL_GPL(trustcore_net_get_intercept);
 
 bool trustcore_net_should_intercept(int sock_type, int protocol)
 {

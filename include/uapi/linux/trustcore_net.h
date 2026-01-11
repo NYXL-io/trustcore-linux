@@ -144,6 +144,23 @@ struct tc_net_eventfds {
 	__u32 reserved;
 };
 
+enum tc_net_intercept_mode {
+	TC_NET_INTERCEPT_OFF = 0,
+	TC_NET_INTERCEPT_ON = 1,
+	TC_NET_INTERCEPT_UID = 2,
+	TC_NET_INTERCEPT_GID = 3,
+	TC_NET_INTERCEPT_CGROUP = 4,
+};
+
+struct tc_net_intercept_req {
+	__u32 mode;
+	__s32 uid;
+	__s32 gid;
+	__u32 flags;
+};
+
+#define TC_NET_INTERCEPT_F_QUERY (1u << 0)
+
 enum tc_net_cgroup_op {
 	TC_NET_CGROUP_ADD = 1,
 	TC_NET_CGROUP_DEL = 2,
@@ -166,5 +183,6 @@ struct tc_net_cgroup_req {
 #define TC_NET_IOC_EVENTFD _IOW(TC_NET_IOC_MAGIC, 0x03, struct tc_net_eventfds)
 #define TC_NET_IOC_KICK    _IO(TC_NET_IOC_MAGIC, 0x04)
 #define TC_NET_IOC_CGROUP  _IOWR(TC_NET_IOC_MAGIC, 0x05, struct tc_net_cgroup_req)
+#define TC_NET_IOC_INTERCEPT _IOWR(TC_NET_IOC_MAGIC, 0x06, struct tc_net_intercept_req)
 
 #endif /* _UAPI_LINUX_TRUSTCORE_NET_H */
