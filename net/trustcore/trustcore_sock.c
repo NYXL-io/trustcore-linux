@@ -243,8 +243,6 @@ int trustcore_sock_deliver_recv_from(u64 stream_id, const void *data, u32 len,
 	struct tc_accept_entry *entry;
 	struct tc_rx_buf *buf;
 	u32 new_bytes;
-	bool log_pending = false;
-	bool log_drop = false;
 	bool log_queue = false;
 	u32 log_bytes = 0;
 	u32 log_bufs = 0;
@@ -281,7 +279,6 @@ int trustcore_sock_deliver_recv_from(u64 stream_id, const void *data, u32 len,
 				entry->rx_queued_bytes = new_bytes;
 				entry->rx_queued_bufs += 1;
 				list_add_tail(&buf->list, &entry->rx_queue);
-				log_pending = true;
 				log_bytes = entry->rx_queued_bytes;
 				log_bufs = entry->rx_queued_bufs;
 				spin_unlock(&tc_pending_accepts_lock);
@@ -292,10 +289,8 @@ int trustcore_sock_deliver_recv_from(u64 stream_id, const void *data, u32 len,
 		}
 		spin_unlock(&tc_pending_accepts_lock);
 		kfree(buf);
-		log_drop = true;
-		if (log_drop)
-			pr_info("trustcore-sock: drop recv stream_id=%llu len=%u (no stream/pending)\n",
-				stream_id, len);
+		pr_info("trustcore-sock: drop recv stream_id=%llu len=%u (no stream/pending)\n",
+			stream_id, len);
 		return 0;
 	}
 
