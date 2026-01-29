@@ -1250,6 +1250,7 @@ static int trustcore_accept(struct socket *sock, struct socket *newsock,
 		return -ENOMEM;
 	}
 	sock_init_data(newsock, newsk);
+	trustcore_init_sock(newsk);
 	newsock->ops = sock->ops;
 	newsk->sk_rcvtimeo = sk->sk_rcvtimeo;
 	newsk->sk_sndtimeo = sk->sk_sndtimeo;
