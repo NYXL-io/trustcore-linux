@@ -1720,7 +1720,7 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 				return 0;
 		}
 
-		pr_info("trustcore-sock: recvmsg dgram stream_id=%llu buf_len=%u\n",
+		pr_info("trustcore-sock: recvmsg dgram stream_id=%llu buf_len=%zu\n",
 			tc->stream_id, buf->len);
 		if (len > buf->len)
 			len = buf->len;
@@ -1781,7 +1781,7 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 			return 0;
 	}
 
-	pr_info("trustcore-sock: recvmsg stream_id=%llu buf_len=%u offset=%u\n",
+	pr_info("trustcore-sock: recvmsg stream_id=%llu buf_len=%zu offset=%zu\n",
 		tc->stream_id, buf->len, buf->offset);
 	if (len > buf->len - buf->offset)
 		len = buf->len - buf->offset;
