@@ -674,21 +674,35 @@ static int tc_rx_thread(void *arg)
 			}
 
 			if (desc.type == TC_NET_DESC_RECV) {
-				if (desc.data_len)
-					trustcore_sock_deliver_recv(desc.stream_id,
+				if (desc.data_len) {
+					int rc;
+					pr_info("trustcore-net: inbound RECV stream_id=%llu len=%u\n",
+						desc.stream_id, desc.data_len);
+					rc = trustcore_sock_deliver_recv(desc.stream_id,
 								    tc_ctx.ring_in.data + desc.data_off,
 								    desc.data_len);
+					if (rc)
+						pr_info("trustcore-net: deliver recv failed stream_id=%llu rc=%d\n",
+							desc.stream_id, rc);
+				}
 				if (tc_ctx.in_eventfd)
 					eventfd_signal(tc_ctx.in_eventfd);
 				continue;
 			}
 			if (desc.type == TC_NET_DESC_DGRAM_RECV) {
-				if (desc.data_len)
-					trustcore_sock_deliver_recv_from(desc.stream_id,
+				if (desc.data_len) {
+					int rc;
+					pr_info("trustcore-net: inbound DGRAM_RECV stream_id=%llu len=%u aux_len=%u\n",
+						desc.stream_id, desc.data_len, desc.aux_len);
+					rc = trustcore_sock_deliver_recv_from(desc.stream_id,
 									 tc_ctx.ring_in.data + desc.data_off,
 									 desc.data_len,
 									 desc.aux_len ? tc_ctx.ring_in.data + desc.aux_off : NULL,
 									 desc.aux_len);
+					if (rc)
+						pr_info("trustcore-net: deliver dgram recv failed stream_id=%llu rc=%d\n",
+							desc.stream_id, rc);
+				}
 				if (tc_ctx.in_eventfd)
 					eventfd_signal(tc_ctx.in_eventfd);
 				continue;
