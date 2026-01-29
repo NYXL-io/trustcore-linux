@@ -112,6 +112,53 @@ MODULE_PARM_DESC(trustcore_intercept_uid, "Intercept only for matching UID (mode
 module_param(trustcore_intercept_gid, int, 0644);
 MODULE_PARM_DESC(trustcore_intercept_gid, "Intercept only for matching GID (mode=3)");
 
+int trustcore_net_set_intercept(const struct tc_net_intercept_req *req)
+{
+	if (!req)
+		return -EINVAL;
+
+	switch (req->mode) {
+	case TRUSTCORE_INTERCEPT_OFF:
+	case TRUSTCORE_INTERCEPT_ON:
+		WRITE_ONCE(trustcore_intercept_uid, -1);
+		WRITE_ONCE(trustcore_intercept_gid, -1);
+		break;
+	case TRUSTCORE_INTERCEPT_UID:
+		if (req->uid < 0)
+			return -EINVAL;
+		WRITE_ONCE(trustcore_intercept_uid, req->uid);
+		WRITE_ONCE(trustcore_intercept_gid, -1);
+		break;
+	case TRUSTCORE_INTERCEPT_GID:
+		if (req->gid < 0)
+			return -EINVAL;
+		WRITE_ONCE(trustcore_intercept_gid, req->gid);
+		WRITE_ONCE(trustcore_intercept_uid, -1);
+		break;
+	case TRUSTCORE_INTERCEPT_CGROUP:
+		WRITE_ONCE(trustcore_intercept_uid, -1);
+		WRITE_ONCE(trustcore_intercept_gid, -1);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(trustcore_intercept_mode, req->mode);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(trustcore_net_set_intercept);
+
+void trustcore_net_get_intercept(struct tc_net_intercept_req *req)
+{
+	if (!req)
+		return;
+	req->mode = READ_ONCE(trustcore_intercept_mode);
+	req->uid = READ_ONCE(trustcore_intercept_uid);
+	req->gid = READ_ONCE(trustcore_intercept_gid);
+	req->flags = 0;
+}
+EXPORT_SYMBOL_GPL(trustcore_net_get_intercept);
+
 struct tc_cgroup_entry {
 	struct list_head list;
 	struct cgroup *cgrp;
