@@ -32,11 +32,11 @@
 #define TRUSTCORE_TX_READY_MIN 1u
 #define TRUSTCORE_RX_MAX_BYTES (4u * 1024u * 1024u)
 #define TRUSTCORE_RX_MAX_BUFS 1024u
-#define TRUSTCORE_INTERCEPT_OFF TC_NET_INTERCEPT_OFF
-#define TRUSTCORE_INTERCEPT_ON TC_NET_INTERCEPT_ON
-#define TRUSTCORE_INTERCEPT_UID TC_NET_INTERCEPT_UID
-#define TRUSTCORE_INTERCEPT_GID TC_NET_INTERCEPT_GID
-#define TRUSTCORE_INTERCEPT_CGROUP TC_NET_INTERCEPT_CGROUP
+#define TRUSTCORE_INTERCEPT_OFF 0
+#define TRUSTCORE_INTERCEPT_ON 1
+#define TRUSTCORE_INTERCEPT_UID 2
+#define TRUSTCORE_INTERCEPT_GID 3
+#define TRUSTCORE_INTERCEPT_CGROUP 4
 
 struct tc_rx_buf {
 	struct list_head list;
@@ -49,9 +49,13 @@ struct tc_rx_buf {
 
 struct tc_accept_entry {
 	struct list_head list;
+	struct list_head rx_queue;
+	u32 rx_queued_bytes;
+	u32 rx_queued_bufs;
 	u64 stream_id;
 	struct sockaddr_storage peer;
 	int peer_len;
+	struct hlist_node node;
 };
 
 struct tc_sock {
@@ -86,9 +90,11 @@ struct tc_sock {
 static DEFINE_HASHTABLE(tc_streams, 10);
 static DEFINE_HASHTABLE(tc_listeners, 10);
 static DEFINE_HASHTABLE(tc_requests, 10);
+static DEFINE_HASHTABLE(tc_pending_accepts, 10);
 static DEFINE_SPINLOCK(tc_streams_lock);
 static DEFINE_SPINLOCK(tc_listeners_lock);
 static DEFINE_SPINLOCK(tc_requests_lock);
+static DEFINE_SPINLOCK(tc_pending_accepts_lock);
 
 static atomic64_t tc_next_stream_id = ATOMIC64_INIT(1);
 static atomic64_t tc_next_listener_id = ATOMIC64_INIT(1);
@@ -187,6 +193,7 @@ int trustcore_sock_deliver_recv_from(u64 stream_id, const void *data, u32 len,
 {
 	struct sock *sk;
 	struct tc_sock *tc;
+	struct tc_accept_entry *entry;
 	struct tc_rx_buf *buf;
 	u32 new_bytes;
 
@@ -196,8 +203,40 @@ int trustcore_sock_deliver_recv_from(u64 stream_id, const void *data, u32 len,
 		return -EINVAL;
 
 	sk = tc_find_stream_sk(stream_id);
-	if (!sk)
+	if (!sk) {
+		buf = kzalloc(sizeof(*buf) + len, GFP_KERNEL);
+		if (!buf)
+			return -ENOMEM;
+		memcpy(buf->data, data, len);
+		buf->len = len;
+		buf->addr_len = 0;
+		if (addr && addr_len) {
+			memcpy(&buf->addr, addr, addr_len);
+			buf->addr_len = addr_len;
+		}
+
+		spin_lock(&tc_pending_accepts_lock);
+		hash_for_each_possible(tc_pending_accepts, entry, node, stream_id) {
+			if (entry->stream_id == stream_id) {
+				if (entry->rx_queued_bufs >= TRUSTCORE_RX_MAX_BUFS ||
+				    check_add_overflow(entry->rx_queued_bytes, len, &new_bytes) ||
+				    new_bytes > TRUSTCORE_RX_MAX_BYTES) {
+					spin_unlock(&tc_pending_accepts_lock);
+					kfree(buf);
+					atomic64_inc(&tc_rx_dropped);
+					return -ENOBUFS;
+				}
+				entry->rx_queued_bytes = new_bytes;
+				entry->rx_queued_bufs += 1;
+				list_add_tail(&buf->list, &entry->rx_queue);
+				spin_unlock(&tc_pending_accepts_lock);
+				return 0;
+			}
+		}
+		spin_unlock(&tc_pending_accepts_lock);
+		kfree(buf);
 		return 0;
+	}
 
 	tc = tc_sk(sk);
 	spin_lock(&tc->rx_lock);
@@ -522,11 +561,18 @@ static void tc_handle_inbound(const struct tc_net_desc *desc,
 			return;
 		}
 		entry->stream_id = desc->stream_id;
+		INIT_LIST_HEAD(&entry->rx_queue);
+		entry->rx_queued_bytes = 0;
+		entry->rx_queued_bufs = 0;
+		INIT_HLIST_NODE(&entry->node);
 		if (aux && (aux_len == sizeof(struct sockaddr_in) ||
 			    aux_len == sizeof(struct sockaddr_in6))) {
 			memcpy(&entry->peer, aux, aux_len);
 			entry->peer_len = aux_len;
 		}
+		spin_lock(&tc_pending_accepts_lock);
+		hash_add(tc_pending_accepts, &entry->node, entry->stream_id);
+		spin_unlock(&tc_pending_accepts_lock);
 		spin_lock(&listener->accept_lock);
 		list_add_tail(&entry->list, &listener->accept_queue);
 		spin_unlock(&listener->accept_lock);
@@ -661,6 +707,15 @@ static void trustcore_destroy_sock(struct sock *sk)
 	spin_lock(&tc->accept_lock);
 	list_for_each_entry_safe(entry, etmp, &tc->accept_queue, list) {
 		list_del(&entry->list);
+		spin_lock(&tc_pending_accepts_lock);
+		if (!hlist_unhashed(&entry->node))
+			hlist_del_init(&entry->node);
+		while (!list_empty(&entry->rx_queue)) {
+			buf = list_first_entry(&entry->rx_queue, struct tc_rx_buf, list);
+			list_del(&buf->list);
+			kfree(buf);
+		}
+		spin_unlock(&tc_pending_accepts_lock);
 		kfree(entry);
 	}
 	spin_unlock(&tc->accept_lock);
@@ -1159,6 +1214,34 @@ static int trustcore_accept(struct socket *sock, struct socket *newsock,
 		child->local_len = listener->local_len;
 	}
 	tc_register_stream(child);
+	{
+		struct list_head pending;
+		u32 pending_bytes = 0;
+		u32 pending_bufs = 0;
+
+		INIT_LIST_HEAD(&pending);
+		spin_lock(&tc_pending_accepts_lock);
+		if (!hlist_unhashed(&entry->node))
+			hlist_del_init(&entry->node);
+		if (!list_empty(&entry->rx_queue)) {
+			list_splice_init(&entry->rx_queue, &pending);
+			pending_bytes = entry->rx_queued_bytes;
+			pending_bufs = entry->rx_queued_bufs;
+			entry->rx_queued_bytes = 0;
+			entry->rx_queued_bufs = 0;
+		}
+		spin_unlock(&tc_pending_accepts_lock);
+
+		if (!list_empty(&pending)) {
+			spin_lock(&child->rx_lock);
+			list_splice_tail(&pending, &child->rx_queue);
+			child->rx_queued_bytes += pending_bytes;
+			child->rx_queued_bufs += pending_bufs;
+			spin_unlock(&child->rx_lock);
+			child->inet.sk.sk_state_change(&child->inet.sk);
+			wake_up_interruptible(&child->wait);
+		}
+	}
 	kfree(entry);
 	return 0;
 }
@@ -1830,49 +1913,6 @@ void trustcore_net_cgroup_clear(void)
 	mutex_unlock(&tc_cgroup_lock);
 }
 EXPORT_SYMBOL_GPL(trustcore_net_cgroup_clear);
-
-int trustcore_net_set_intercept(const struct tc_net_intercept_req *req)
-{
-	if (!req)
-		return -EINVAL;
-
-	switch (req->mode) {
-	case TC_NET_INTERCEPT_OFF:
-	case TC_NET_INTERCEPT_ON:
-	case TC_NET_INTERCEPT_CGROUP:
-		WRITE_ONCE(trustcore_intercept_uid, -1);
-		WRITE_ONCE(trustcore_intercept_gid, -1);
-		break;
-	case TC_NET_INTERCEPT_UID:
-		if (req->uid < 0)
-			return -EINVAL;
-		WRITE_ONCE(trustcore_intercept_uid, req->uid);
-		WRITE_ONCE(trustcore_intercept_gid, -1);
-		break;
-	case TC_NET_INTERCEPT_GID:
-		if (req->gid < 0)
-			return -EINVAL;
-		WRITE_ONCE(trustcore_intercept_gid, req->gid);
-		WRITE_ONCE(trustcore_intercept_uid, -1);
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	WRITE_ONCE(trustcore_intercept_mode, req->mode);
-	return 0;
-}
-EXPORT_SYMBOL_GPL(trustcore_net_set_intercept);
-
-void trustcore_net_get_intercept(struct tc_net_intercept_req *req)
-{
-	if (!req)
-		return;
-	req->mode = READ_ONCE(trustcore_intercept_mode);
-	req->uid = READ_ONCE(trustcore_intercept_uid);
-	req->gid = READ_ONCE(trustcore_intercept_gid);
-}
-EXPORT_SYMBOL_GPL(trustcore_net_get_intercept);
 
 bool trustcore_net_should_intercept(int sock_type, int protocol)
 {
