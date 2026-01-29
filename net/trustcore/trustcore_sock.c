@@ -243,9 +243,6 @@ int trustcore_sock_deliver_recv_from(u64 stream_id, const void *data, u32 len,
 	struct tc_accept_entry *entry;
 	struct tc_rx_buf *buf;
 	u32 new_bytes;
-	bool log_queue = false;
-	u32 log_bytes = 0;
-	u32 log_bufs = 0;
 
 	if (!data || !len)
 		return 0;
@@ -279,18 +276,12 @@ int trustcore_sock_deliver_recv_from(u64 stream_id, const void *data, u32 len,
 				entry->rx_queued_bytes = new_bytes;
 				entry->rx_queued_bufs += 1;
 				list_add_tail(&buf->list, &entry->rx_queue);
-				log_bytes = entry->rx_queued_bytes;
-				log_bufs = entry->rx_queued_bufs;
 				spin_unlock(&tc_pending_accepts_lock);
-				pr_info("trustcore-sock: buffered recv stream_id=%llu len=%u queued_bytes=%u queued_bufs=%u\n",
-					stream_id, len, log_bytes, log_bufs);
 				return 0;
 			}
 		}
 		spin_unlock(&tc_pending_accepts_lock);
 		kfree(buf);
-		pr_info("trustcore-sock: drop recv stream_id=%llu len=%u (no stream/pending)\n",
-			stream_id, len);
 		return 0;
 	}
 
@@ -327,16 +318,10 @@ int trustcore_sock_deliver_recv_from(u64 stream_id, const void *data, u32 len,
 	}
 	spin_lock(&tc->rx_lock);
 	list_add_tail(&buf->list, &tc->rx_queue);
-	log_queue = true;
-	log_bytes = tc->rx_queued_bytes;
-	log_bufs = tc->rx_queued_bufs;
 	spin_unlock(&tc->rx_lock);
 	tc->inet.sk.sk_state_change(&tc->inet.sk);
 	wake_up_interruptible(&tc->wait);
 	sock_put(sk);
-	if (log_queue)
-		pr_info("trustcore-sock: queued recv stream_id=%llu len=%u queued_bytes=%u queued_bufs=%u\n",
-			stream_id, len, log_bytes, log_bufs);
 	return 0;
 }
 
@@ -638,8 +623,6 @@ static void tc_handle_inbound(const struct tc_net_desc *desc,
 		spin_lock(&listener->accept_lock);
 		list_add_tail(&entry->list, &listener->accept_queue);
 		spin_unlock(&listener->accept_lock);
-		pr_info("trustcore-sock: inbound ACCEPT listener_id=%llu stream_id=%llu peer_len=%u\n",
-			desc->listener_id, desc->stream_id, entry->peer_len);
 		listener->inet.sk.sk_state_change(&listener->inet.sk);
 		wake_up_interruptible(&listener->wait);
 		sock_put(lsk);
@@ -1306,8 +1289,6 @@ static int trustcore_accept(struct socket *sock, struct socket *newsock,
 			child->inet.sk.sk_state_change(&child->inet.sk);
 			wake_up_interruptible(&child->wait);
 		}
-		pr_info("trustcore-sock: accept complete stream_id=%llu pending_bytes=%u pending_bufs=%u\n",
-			child->stream_id, pending_bytes, pending_bufs);
 	}
 	kfree(entry);
 	return 0;
@@ -1721,8 +1702,6 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 				return 0;
 		}
 
-		pr_info("trustcore-sock: recvmsg dgram stream_id=%llu buf_len=%zu\n",
-			tc->stream_id, buf->len);
 		if (len > buf->len)
 			len = buf->len;
 		if (copy_to_iter(buf->data, len, &msg->msg_iter) != len) {
@@ -1782,8 +1761,6 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 			return 0;
 	}
 
-	pr_info("trustcore-sock: recvmsg stream_id=%llu buf_len=%zu offset=%zu\n",
-		tc->stream_id, buf->len, buf->offset);
 	if (len > buf->len - buf->offset)
 		len = buf->len - buf->offset;
 	if (copy_to_iter(buf->data + buf->offset, len, &msg->msg_iter) != len) {
