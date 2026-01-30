@@ -4,6 +4,7 @@
 #include <linux/in6.h>
 #include <linux/init.h>
 #include <linux/jiffies.h>
+#include <linux/ktime.h>
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/overflow.h>
@@ -37,6 +38,21 @@
 #define TRUSTCORE_INTERCEPT_UID 2
 #define TRUSTCORE_INTERCEPT_GID 3
 #define TRUSTCORE_INTERCEPT_CGROUP 4
+
+static bool tc_trace_net = true;
+module_param_named(trace_net, tc_trace_net, bool, 0644);
+MODULE_PARM_DESC(trace_net, "Enable trustcore net trace logging");
+
+static __always_inline u64 tc_trace_now_us(void)
+{
+	return ktime_get_ns() / 1000ull;
+}
+
+#define TC_TRACE(fmt, ...)                                                     \
+	do {                                                                   \
+		if (unlikely(tc_trace_net))                                    \
+			pr_info("trustcore-trace: " fmt, ##__VA_ARGS__);        \
+	} while (0)
 
 struct tc_rx_buf {
 	struct list_head list;
@@ -242,6 +258,8 @@ int trustcore_sock_deliver_recv_from(u64 stream_id, const void *data, u32 len,
 	struct tc_sock *tc;
 	struct tc_accept_entry *entry;
 	struct tc_rx_buf *buf;
+	u32 queued_bufs = 0;
+	u32 queued_bytes = 0;
 	u32 new_bytes;
 
 	if (!data || !len)
@@ -249,6 +267,8 @@ int trustcore_sock_deliver_recv_from(u64 stream_id, const void *data, u32 len,
 	if (addr_len > sizeof(struct sockaddr_storage))
 		return -EINVAL;
 
+	TC_TRACE("recv_from_enter stream_id=%llu len=%u t_us=%llu\n",
+		 stream_id, len, tc_trace_now_us());
 	sk = tc_find_stream_sk(stream_id);
 	if (!sk) {
 		buf = kzalloc(sizeof(*buf) + len, GFP_KERNEL);
@@ -275,8 +295,13 @@ int trustcore_sock_deliver_recv_from(u64 stream_id, const void *data, u32 len,
 				}
 				entry->rx_queued_bytes = new_bytes;
 				entry->rx_queued_bufs += 1;
+				queued_bytes = entry->rx_queued_bytes;
+				queued_bufs = entry->rx_queued_bufs;
 				list_add_tail(&buf->list, &entry->rx_queue);
 				spin_unlock(&tc_pending_accepts_lock);
+				TC_TRACE("recv_enqueue_pending stream_id=%llu len=%u queued_bytes=%u queued_bufs=%u t_us=%llu\n",
+					 stream_id, len, queued_bytes, queued_bufs,
+					 tc_trace_now_us());
 				return 0;
 			}
 		}
@@ -297,6 +322,8 @@ int trustcore_sock_deliver_recv_from(u64 stream_id, const void *data, u32 len,
 	}
 	tc->rx_queued_bytes = new_bytes;
 	tc->rx_queued_bufs += 1;
+	queued_bytes = tc->rx_queued_bytes;
+	queued_bufs = tc->rx_queued_bufs;
 	spin_unlock(&tc->rx_lock);
 
 	buf = kzalloc(sizeof(*buf) + len, GFP_KERNEL);
@@ -319,7 +346,10 @@ int trustcore_sock_deliver_recv_from(u64 stream_id, const void *data, u32 len,
 	spin_lock(&tc->rx_lock);
 	list_add_tail(&buf->list, &tc->rx_queue);
 	spin_unlock(&tc->rx_lock);
+	TC_TRACE("recv_enqueue stream_id=%llu len=%u queued_bytes=%u queued_bufs=%u t_us=%llu\n",
+		 stream_id, len, queued_bytes, queued_bufs, tc_trace_now_us());
 	tc->inet.sk.sk_state_change(&tc->inet.sk);
+	TC_TRACE("recv_wake stream_id=%llu t_us=%llu\n", stream_id, tc_trace_now_us());
 	wake_up_interruptible(&tc->wait);
 	sock_put(sk);
 	return 0;
@@ -1551,6 +1581,9 @@ static int trustcore_sendmsg(struct socket *sock, struct msghdr *msg, size_t len
 	bool nonblock = msg->msg_flags & MSG_DONTWAIT;
 	int rc;
 
+	TC_TRACE("sendmsg_enter stream_id=%llu len=%zu type=%d t_us=%llu\n",
+		 tc->stream_id, len, sock->type, tc_trace_now_us());
+
 	if (sock->type == SOCK_DGRAM) {
 		const struct sockaddr *daddr = NULL;
 		u32 daddr_len = 0;
@@ -1626,6 +1659,8 @@ static int trustcore_sendmsg(struct socket *sock, struct msghdr *msg, size_t len
 			}
 		}
 
+		TC_TRACE("sendmsg_exit stream_id=%llu bytes=%zu t_us=%llu\n",
+			 tc->stream_id, len, tc_trace_now_us());
 		return (int)len;
 	}
 
@@ -1656,6 +1691,8 @@ static int trustcore_sendmsg(struct socket *sock, struct msghdr *msg, size_t len
 		remaining -= chunk;
 	}
 
+	TC_TRACE("sendmsg_exit stream_id=%llu bytes=%zu t_us=%llu\n",
+		 tc->stream_id, total, tc_trace_now_us());
 	return (int)total;
 }
 
@@ -1668,6 +1705,9 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 	long timeout;
 	long wait_rc;
 	int rc;
+
+	TC_TRACE("recvmsg_enter stream_id=%llu len=%zu flags=%d type=%d t_us=%llu\n",
+		 tc->stream_id, len, flags, sock->type, tc_trace_now_us());
 
 	if (sock->type == SOCK_DGRAM) {
 		if (!trustcore_net_ready())
@@ -1693,9 +1733,13 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 				return -EAGAIN;
 
 			timeout = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
+			TC_TRACE("recvmsg_wait stream_id=%llu t_us=%llu\n",
+				 tc->stream_id, tc_trace_now_us());
 			wait_rc = wait_event_interruptible_timeout(tc->wait,
 								   !list_empty(&tc->rx_queue) || tc->closing,
 								   timeout);
+			TC_TRACE("recvmsg_wake stream_id=%llu rc=%ld t_us=%llu\n",
+				 tc->stream_id, wait_rc, tc_trace_now_us());
 			if (wait_rc <= 0)
 				return wait_rc == 0 ? -ETIMEDOUT : (int)wait_rc;
 			if (tc->closing)
@@ -1732,6 +1776,8 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 		tc->rx_queued_bufs--;
 		spin_unlock(&tc->rx_lock);
 		kfree(buf);
+		TC_TRACE("recvmsg_exit stream_id=%llu bytes=%zu t_us=%llu\n",
+			 tc->stream_id, copied, tc_trace_now_us());
 		return (int)copied;
 	}
 
@@ -1752,9 +1798,13 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 			return -EAGAIN;
 
 		timeout = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
+		TC_TRACE("recvmsg_wait stream_id=%llu t_us=%llu\n",
+			 tc->stream_id, tc_trace_now_us());
 		wait_rc = wait_event_interruptible_timeout(tc->wait,
 							   !list_empty(&tc->rx_queue) || tc->closing,
 							   timeout);
+		TC_TRACE("recvmsg_wake stream_id=%llu rc=%ld t_us=%llu\n",
+			 tc->stream_id, wait_rc, tc_trace_now_us());
 		if (wait_rc <= 0)
 			return wait_rc == 0 ? -ETIMEDOUT : (int)wait_rc;
 		if (tc->closing)
@@ -1785,6 +1835,8 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 		kfree(buf);
 	}
 
+	TC_TRACE("recvmsg_exit stream_id=%llu bytes=%zu t_us=%llu\n",
+		 tc->stream_id, copied, tc_trace_now_us());
 	return (int)copied;
 }
 
