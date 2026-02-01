@@ -6,7 +6,9 @@
 #include <linux/fs.h>
 #include <linux/in.h>
 #include <linux/in6.h>
+#include <linux/jiffies.h>
 #include <linux/kthread.h>
+#include <linux/ktime.h>
 #include <linux/miscdevice.h>
 #include <linux/mm.h>
 #include <linux/module.h>
@@ -82,11 +84,37 @@ static unsigned int tc_out_data_size = 16 * 1024 * 1024;
 static unsigned int tc_in_data_size = 16 * 1024 * 1024;
 static unsigned int tc_max_payload = 64 * 1024;
 
+/*
+ * Latency tuning knobs.
+ *
+ * The rings are shared memory and userspace updates head/tail indices
+ * directly. In the ideal design, userspace issues a doorbell (ioctl KICK or
+ * write) immediately after advancing indices to wake kernel waiters.
+ *
+ * If userspace batches doorbells or is delayed (scheduler, GC, etc.), kernel
+ * waiters can stall for milliseconds even though the ring indices already
+ * advanced. The settings below provide a "kickless" safety net by periodically
+ * waking and re-checking ring indices and, optionally, briefly spinning before
+ * blocking.
+ *
+ * Trade-off: lower tail latency vs higher CPU wakeups under backpressure.
+ */
+static unsigned int tc_ring_spin_us = 50;   /* busy-wait before sleeping */
+static unsigned int tc_ring_poll_us = 1000; /* periodic wake when blocked */
+static unsigned int tc_rx_poll_us = 1000;   /* periodic wake for rx thread */
+
 module_param(tc_out_desc_count, uint, 0644);
 module_param(tc_in_desc_count, uint, 0644);
 module_param(tc_out_data_size, uint, 0644);
 module_param(tc_in_data_size, uint, 0644);
 module_param(tc_max_payload, uint, 0644);
+module_param(tc_ring_spin_us, uint, 0644);
+module_param(tc_ring_poll_us, uint, 0644);
+module_param(tc_rx_poll_us, uint, 0644);
+
+MODULE_PARM_DESC(tc_ring_spin_us, "Spin (usec) before blocking on full ring");
+MODULE_PARM_DESC(tc_ring_poll_us, "Blocked ring polling interval (usec), 0=disable");
+MODULE_PARM_DESC(tc_rx_poll_us, "Rx thread polling interval (usec), 0=disable");
 
 static u32 tc_ring_header_size(void)
 {
@@ -193,6 +221,60 @@ static bool tc_ring_has_space(const struct tc_ring *ring, u32 needed)
 		return false;
 
 	return true;
+}
+
+static __always_inline void tc_ring_spin_wait_for_space(const struct tc_ring *ring,
+					       u32 needed)
+{
+	u64 end_ns;
+
+	if (!tc_ring_spin_us)
+		return;
+
+	/*
+	 * Short spin to catch the common case where userspace has already advanced
+	 * tail indices but has not yet doorbelled the kernel.
+	 */
+	end_ns = ktime_get_ns() + (u64)tc_ring_spin_us * 1000ull;
+	while (ktime_get_ns() < end_ns) {
+		if (tc_ring_has_space(ring, needed) || !trustcore_net_ready())
+			break;
+		cpu_relax();
+	}
+}
+
+static int tc_ring_wait_for_space(struct tc_ring *ring, u32 needed)
+{
+	long rc;
+
+	if (!tc_ring_poll_us) {
+		rc = wait_event_interruptible(ring->wait,
+					 tc_ring_has_space(ring, needed) ||
+					 !trustcore_net_ready());
+		if (rc)
+			return (int)rc;
+		return trustcore_net_ready() ? 0 : -ENETDOWN;
+	}
+
+#ifdef wait_event_interruptible_hrtimeout
+	rc = wait_event_interruptible_hrtimeout(ring->wait,
+					 tc_ring_has_space(ring, needed) ||
+					 !trustcore_net_ready(),
+					 ktime_set(0, (u64)tc_ring_poll_us * 1000ull));
+	if (rc == -ETIME)
+		return 0;
+	if (rc)
+		return (int)rc;
+	return trustcore_net_ready() ? 0 : -ENETDOWN;
+#else
+	rc = wait_event_interruptible_timeout(ring->wait,
+					 tc_ring_has_space(ring, needed) ||
+					 !trustcore_net_ready(),
+					 usecs_to_jiffies(tc_ring_poll_us));
+	if (rc < 0)
+		return (int)rc;
+	return trustcore_net_ready() ? 0 : -ENETDOWN;
+#endif
 }
 
 static int tc_ring_try_push(struct tc_ring *ring,
@@ -368,11 +450,22 @@ static int tc_ring_push(struct tc_ring *ring,
 		rc = tc_ring_try_push(ring, desc, data, data_len, aux, aux_len);
 		spin_unlock(&ring->lock);
 		if (rc == -ENOSPC && !nonblock) {
-			wait_event_interruptible(ring->wait,
-						 tc_ring_has_space(ring, needed) ||
-						 !trustcore_net_ready());
+			int wrc;
+
+			/*
+			 * Best effort: spin briefly to catch the common case where
+			 * userspace has already advanced tails but hasn't doorbelled.
+			 */
+			tc_ring_spin_wait_for_space(ring, needed);
 			if (!trustcore_net_ready())
 				return -ENETDOWN;
+			if (!tc_ring_has_space(ring, needed)) {
+				wrc = tc_ring_wait_for_space(ring, needed);
+				if (wrc)
+					return wrc;
+				if (!trustcore_net_ready())
+					return -ENETDOWN;
+			}
 			continue;
 		}
 		return rc;
@@ -630,11 +723,18 @@ int trustcore_net_send_desc_iter(struct tc_net_desc *desc,
 					   aux, aux_len);
 		spin_unlock(&tc_ctx.ring_out.lock);
 		if (rc == -ENOSPC && !nonblock) {
-			wait_event_interruptible(tc_ctx.ring_out.wait,
-						 tc_ring_has_space(&tc_ctx.ring_out, needed) ||
-						 !trustcore_net_ready());
+			int wrc;
+
+			tc_ring_spin_wait_for_space(&tc_ctx.ring_out, needed);
 			if (!trustcore_net_ready())
 				return -ENETDOWN;
+			if (!tc_ring_has_space(&tc_ctx.ring_out, needed)) {
+				wrc = tc_ring_wait_for_space(&tc_ctx.ring_out, needed);
+				if (wrc)
+					return wrc;
+				if (!trustcore_net_ready())
+					return -ENETDOWN;
+			}
 			continue;
 		}
 		if (rc) {
@@ -652,19 +752,44 @@ int trustcore_net_send_desc_iter(struct tc_net_desc *desc,
 static int tc_rx_thread(void *arg)
 {
 	struct tc_net_desc desc;
+	bool popped_any;
 
 	while (!kthread_should_stop()) {
-		wait_event_interruptible(tc_ctx.ring_in.wait,
-					 tc_ring_has_desc(&tc_ctx.ring_in) ||
-					 kthread_should_stop());
+		if (tc_rx_poll_us) {
+#ifdef wait_event_interruptible_hrtimeout
+			long wrc = wait_event_interruptible_hrtimeout(
+					tc_ctx.ring_in.wait,
+					tc_ring_has_desc(&tc_ctx.ring_in) ||
+					kthread_should_stop(),
+					ktime_set(0, (u64)tc_rx_poll_us * 1000ull));
+			if (wrc == -ERESTARTSYS)
+				continue;
+#else
+			long wrc = wait_event_interruptible_timeout(
+					tc_ctx.ring_in.wait,
+					tc_ring_has_desc(&tc_ctx.ring_in) ||
+					kthread_should_stop(),
+					usecs_to_jiffies(tc_rx_poll_us));
+			if (wrc < 0)
+				continue;
+#endif
+		} else {
+			int wrc = wait_event_interruptible(tc_ctx.ring_in.wait,
+						 tc_ring_has_desc(&tc_ctx.ring_in) ||
+						 kthread_should_stop());
+			if (wrc)
+				continue;
+		}
 		if (kthread_should_stop())
 			break;
 
+		popped_any = false;
 		while (tc_ring_has_desc(&tc_ctx.ring_in)) {
 			void *data_buf = NULL;
 			void *aux_buf = NULL;
 			if (!tc_ring_pop(&tc_ctx.ring_in, &desc))
 				break;
+			popped_any = true;
 			if (!tc_desc_validate_in(&tc_ctx.ring_in, &desc)) {
 				pr_debug_ratelimited("trustcore-net: drop invalid inbound desc type=%u\n",
 						     desc.type);
@@ -716,6 +841,13 @@ static int tc_rx_thread(void *arg)
 			if (tc_ctx.in_eventfd)
 				eventfd_signal(tc_ctx.in_eventfd);
 		}
+		/*
+		 * Userspace may poll() for POLLOUT to know when it can write more
+		 * responses into ring_in. Wake pollers after we've freed at least
+		 * one descriptor slot.
+		 */
+		if (popped_any)
+			wake_up_interruptible(&tc_ctx.ring_in.wait);
 	}
 
 	return 0;
@@ -830,13 +962,13 @@ static long tc_device_ioctl(struct file *file, unsigned int cmd, unsigned long a
 			tc_ring_free(&tc_ctx.ring_out);
 			break;
 		}
-		tc_ctx.configured = true;
+		WRITE_ONCE(tc_ctx.configured, true);
 		if (!tc_ctx.rx_thread) {
 			tc_ctx.rx_thread = kthread_run(tc_rx_thread, NULL, "trustcore-net");
 			if (IS_ERR(tc_ctx.rx_thread)) {
 				rc = PTR_ERR(tc_ctx.rx_thread);
 				tc_ctx.rx_thread = NULL;
-				tc_ctx.configured = false;
+				WRITE_ONCE(tc_ctx.configured, false);
 				tc_ring_free(&tc_ctx.ring_out);
 				tc_ring_free(&tc_ctx.ring_in);
 				break;

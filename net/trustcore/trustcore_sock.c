@@ -22,6 +22,8 @@
 #include <linux/uio.h>
 #include <linux/cgroup.h>
 #include <linux/seq_file.h>
+#include <linux/jump_label.h>
+#include <linux/kstrtox.h>
 #include <net/inet_common.h>
 #include <net/inet_sock.h>
 #include <net/sock.h>
@@ -39,9 +41,54 @@
 #define TRUSTCORE_INTERCEPT_GID 3
 #define TRUSTCORE_INTERCEPT_CGROUP 4
 
-static bool tc_trace_net = true;
+/*
+ * Trace logging is intentionally off by default.
+ *
+ * When enabled, trace logging can add *significant* latency due to printk
+ * overhead and lock contention. Keep it disabled in production.
+ */
+#if IS_ENABLED(CONFIG_JUMP_LABEL)
+static DEFINE_STATIC_KEY_FALSE(tc_trace_key);
+static bool tc_trace_net;
+
+static int tc_trace_net_set(const char *val, const struct kernel_param *kp)
+{
+	bool enabled;
+	int rc;
+
+	rc = kstrtobool(val, &enabled);
+	if (rc)
+		return rc;
+
+	if (enabled)
+		static_branch_enable(&tc_trace_key);
+	else
+		static_branch_disable(&tc_trace_key);
+
+	WRITE_ONCE(tc_trace_net, enabled);
+	return 0;
+}
+
+static const struct kernel_param_ops tc_trace_net_ops = {
+	.set = tc_trace_net_set,
+	.get = param_get_bool,
+};
+module_param_cb(trace_net, &tc_trace_net_ops, &tc_trace_net, 0644);
+
+static __always_inline bool tc_trace_enabled(void)
+{
+	return static_branch_unlikely(&tc_trace_key);
+}
+#else
+static bool tc_trace_net;
 module_param_named(trace_net, tc_trace_net, bool, 0644);
-MODULE_PARM_DESC(trace_net, "Enable trustcore net trace logging");
+
+static __always_inline bool tc_trace_enabled(void)
+{
+	return unlikely(READ_ONCE(tc_trace_net));
+}
+#endif
+MODULE_PARM_DESC(trace_net, "Enable trustcore net trace logging (high overhead)");
 
 static __always_inline u64 tc_trace_now_us(void)
 {
@@ -50,8 +97,9 @@ static __always_inline u64 tc_trace_now_us(void)
 
 #define TC_TRACE(fmt, ...)                                                     \
 	do {                                                                   \
-		if (unlikely(tc_trace_net))                                    \
-			pr_info("trustcore-trace: " fmt, ##__VA_ARGS__);        \
+		if (tc_trace_enabled())                                       \
+			pr_info_ratelimited("trustcore-trace: " fmt,           \
+					  ##__VA_ARGS__);                         \
 	} while (0)
 
 struct tc_rx_buf {
@@ -271,10 +319,12 @@ int trustcore_sock_deliver_recv_from(u64 stream_id, const void *data, u32 len,
 		 stream_id, len, tc_trace_now_us());
 	sk = tc_find_stream_sk(stream_id);
 	if (!sk) {
-		buf = kzalloc(sizeof(*buf) + len, GFP_KERNEL);
+		buf = kmalloc(sizeof(*buf) + len, GFP_KERNEL);
 		if (!buf)
 			return -ENOMEM;
+		INIT_LIST_HEAD(&buf->list);
 		memcpy(buf->data, data, len);
+		buf->offset = 0;
 		buf->len = len;
 		buf->addr_len = 0;
 		if (addr && addr_len) {
@@ -326,7 +376,7 @@ int trustcore_sock_deliver_recv_from(u64 stream_id, const void *data, u32 len,
 	queued_bufs = tc->rx_queued_bufs;
 	spin_unlock(&tc->rx_lock);
 
-	buf = kzalloc(sizeof(*buf) + len, GFP_KERNEL);
+	buf = kmalloc(sizeof(*buf) + len, GFP_KERNEL);
 	if (!buf) {
 		spin_lock(&tc->rx_lock);
 		tc->rx_queued_bytes -= len;
@@ -336,7 +386,9 @@ int trustcore_sock_deliver_recv_from(u64 stream_id, const void *data, u32 len,
 		sock_put(sk);
 		return -ENOMEM;
 	}
+	INIT_LIST_HEAD(&buf->list);
 	memcpy(buf->data, data, len);
+	buf->offset = 0;
 	buf->len = len;
 	buf->addr_len = 0;
 	if (addr && addr_len) {
@@ -1669,26 +1721,29 @@ static int trustcore_sendmsg(struct socket *sock, struct msghdr *msg, size_t len
 	if (sk->sk_state != TCP_ESTABLISHED || !tc->stream_id)
 		return -ENOTCONN;
 
-	while (remaining) {
+	/* max_payload is configured by the control plane and is stable for the life of the ring */
+	{
 		u32 max_payload = trustcore_net_max_payload();
-		u32 chunk;
-		struct tc_net_desc desc = {};
 		if (!max_payload)
 			return -ENETDOWN;
-		chunk = min_t(u32, remaining, max_payload);
-		desc.type = TC_NET_DESC_SEND;
-		desc.stream_id = tc->stream_id;
-		desc.req_id = 0;
-		desc.status = 0;
-		rc = trustcore_net_send_desc_iter(&desc, &msg->msg_iter, chunk,
+		while (remaining) {
+			u32 chunk;
+			struct tc_net_desc desc = {};
+			chunk = min_t(u32, remaining, max_payload);
+			desc.type = TC_NET_DESC_SEND;
+			desc.stream_id = tc->stream_id;
+			desc.req_id = 0;
+			desc.status = 0;
+			rc = trustcore_net_send_desc_iter(&desc, &msg->msg_iter, chunk,
 						  NULL, 0, nonblock);
-		if (rc) {
-			if (rc == -ENOSPC)
-				rc = -EAGAIN;
-			return total ? (int)total : rc;
+			if (rc) {
+				if (rc == -ENOSPC)
+					rc = -EAGAIN;
+				return total ? (int)total : rc;
+			}
+			total += chunk;
+			remaining -= chunk;
 		}
-		total += chunk;
-		remaining -= chunk;
 	}
 
 	TC_TRACE("sendmsg_exit stream_id=%llu bytes=%zu t_us=%llu\n",
