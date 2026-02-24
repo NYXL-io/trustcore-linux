@@ -5,7 +5,7 @@
 
 #define TRUSTCORE_NET_VERSION 3u
 #define TRUSTCORE_NET_MAX_PAYLOAD (256u * 1024u)
-/* Version 2 adds listener_id in tc_net_desc; version 3 adds UDP descriptors. */
+/* Version 2 adds listener_id in tc_net_desc; version 3 adds UDP + resolver descriptors. */
 
 enum tc_net_desc_type {
 	TC_NET_DESC_CONNECT = 1,
@@ -23,6 +23,8 @@ enum tc_net_desc_type {
 	TC_NET_DESC_DGRAM_CONNECT_RESP = 13,
 	TC_NET_DESC_DGRAM_SEND = 14,
 	TC_NET_DESC_DGRAM_RECV = 15,
+	TC_NET_DESC_GETRESOLVEHOSTNAME = 16,
+	TC_NET_DESC_GETRESOLVEHOSTNAME_RESP = 17,
 };
 
 /* Descriptor flags */
@@ -59,6 +61,10 @@ enum tc_net_desc_flags {
  * DGRAM_CONNECT_RESP: req_id!=0, stream_id!=0 on success; aux optional local sockaddr.
  * DGRAM_SEND: stream_id!=0, data_len>0, aux optional sockaddr(remote).
  * DGRAM_RECV: stream_id!=0, data_len>0, aux optional sockaddr(remote).
+ * GETRESOLVEHOSTNAME: req_id!=0, data=hostname bytes (NUL optional),
+ *                     credit=AF_UNSPEC/AF_INET/AF_INET6.
+ * GETRESOLVEHOSTNAME_RESP: req_id!=0, status=0 or errno, data optional
+ *                          newline-separated IP addresses.
  *
  * Status semantics:
  * - For *_RESP: status is 0 or a positive errno value.

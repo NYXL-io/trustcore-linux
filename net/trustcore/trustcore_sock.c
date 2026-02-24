@@ -165,7 +165,7 @@ static atomic64_t tc_next_listener_id = ATOMIC64_INIT(1);
 static atomic64_t tc_next_req_id = ATOMIC64_INIT(1);
 static atomic64_t tc_rx_dropped = ATOMIC64_INIT(0);
 static atomic64_t tc_rx_oom = ATOMIC64_INIT(0);
-static int trustcore_intercept_mode = TRUSTCORE_INTERCEPT_ON;
+static int trustcore_intercept_mode = TRUSTCORE_INTERCEPT_OFF;
 static int trustcore_intercept_uid = -1;
 static int trustcore_intercept_gid = -1;
 
@@ -738,7 +738,18 @@ static void tc_handle_inbound(const struct tc_net_desc *desc,
 		kfree(aux);
 		return;
 	}
+	case TC_NET_DESC_GETRESOLVEHOSTNAME_RESP:
+		pr_warn_ratelimited("trustcore_sock: dropping GETRESOLVEHOSTNAME_RESP req_id=%llu stream_id=%llu (kernel resolver response path not wired)\n",
+				    (unsigned long long)desc->req_id,
+				    (unsigned long long)desc->stream_id);
+		kfree(data);
+		kfree(aux);
+		return;
 	default:
+		pr_warn_ratelimited("trustcore_sock: dropped unsupported inbound desc type=%u stream_id=%llu req_id=%llu\n",
+				    desc->type,
+				    (unsigned long long)desc->stream_id,
+				    (unsigned long long)desc->req_id);
 		kfree(data);
 		kfree(aux);
 		return;
