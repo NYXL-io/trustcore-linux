@@ -3,9 +3,9 @@
 
 #include <linux/types.h>
 
-#define TRUSTCORE_NET_VERSION 3u
+#define TRUSTCORE_NET_VERSION 4u
 #define TRUSTCORE_NET_MAX_PAYLOAD (256u * 1024u)
-/* Version 2 adds listener_id in tc_net_desc; version 3 adds UDP + resolver descriptors. */
+/* Version 2 adds listener_id; version 3 adds UDP descriptors; version 4 adds TC_NET_IOC_RESOLVE. */
 
 enum tc_net_desc_type {
 	TC_NET_DESC_CONNECT = 1,
@@ -181,6 +181,39 @@ struct tc_net_cgroup_req {
 	__u64 cgroup_id;
 };
 
+#define TC_NET_RESOLVE_MAX_HOSTNAME 255u
+#define TC_NET_RESOLVE_MAX_ADDRS 16u
+
+enum tc_net_resolve_flags {
+	TC_NET_RESOLVE_F_NONE = 0,
+};
+
+struct tc_net_resolve_addr {
+	__u32 family;
+	__u32 reserved;
+	__u8 addr[16];
+};
+
+struct tc_net_resolve_req {
+	__u32 family;
+	__u32 flags;
+	__u32 timeout_ms;
+	__u32 reserved;
+	char hostname[TC_NET_RESOLVE_MAX_HOSTNAME + 1];
+};
+
+struct tc_net_resolve_resp {
+	/* 0 on success, otherwise positive errno value. */
+	__s32 status;
+	__u32 addr_count;
+	struct tc_net_resolve_addr addrs[TC_NET_RESOLVE_MAX_ADDRS];
+};
+
+struct tc_net_resolve {
+	struct tc_net_resolve_req req;
+	struct tc_net_resolve_resp resp;
+};
+
 #define TC_NET_IOC_MAGIC 'T'
 
 #define TC_NET_IOC_VERSION _IOWR(TC_NET_IOC_MAGIC, 0x00, struct tc_net_version)
@@ -190,5 +223,6 @@ struct tc_net_cgroup_req {
 #define TC_NET_IOC_KICK    _IO(TC_NET_IOC_MAGIC, 0x04)
 #define TC_NET_IOC_CGROUP  _IOWR(TC_NET_IOC_MAGIC, 0x05, struct tc_net_cgroup_req)
 #define TC_NET_IOC_INTERCEPT _IOWR(TC_NET_IOC_MAGIC, 0x06, struct tc_net_intercept_req)
+#define TC_NET_IOC_RESOLVE _IOWR(TC_NET_IOC_MAGIC, 0x07, struct tc_net_resolve)
 
 #endif /* _UAPI_LINUX_TRUSTCORE_NET_H */

@@ -4,8 +4,11 @@
 #include <linux/errno.h>
 #include <linux/debugfs.h>
 #include <linux/fs.h>
+#include <linux/hash.h>
+#include <linux/hashtable.h>
 #include <linux/in.h>
 #include <linux/in6.h>
+#include <linux/inet.h>
 #include <linux/jiffies.h>
 #include <linux/kthread.h>
 #include <linux/ktime.h>
@@ -52,6 +55,25 @@ static tc_net_inbound_fn tc_inbound_handler;
 static atomic64_t tc_in_bad_desc = ATOMIC64_INIT(0);
 static atomic64_t tc_in_bad_bounds = ATOMIC64_INIT(0);
 static atomic64_t tc_in_unknown_type = ATOMIC64_INIT(0);
+static atomic64_t tc_resolve_completed = ATOMIC64_INIT(0);
+static atomic64_t tc_resolve_timeouts = ATOMIC64_INIT(0);
+static atomic64_t tc_resolve_dropped = ATOMIC64_INIT(0);
+
+#define TC_RESOLVE_PENDING_HASH_BITS 8
+static DEFINE_HASHTABLE(tc_resolve_pending, TC_RESOLVE_PENDING_HASH_BITS);
+static DEFINE_SPINLOCK(tc_resolve_lock);
+static atomic64_t tc_resolve_next_req_id = ATOMIC64_INIT(1);
+static atomic_t tc_resolve_pending_count = ATOMIC_INIT(0);
+
+struct tc_resolve_pending_request {
+	u64 req_id;
+	wait_queue_head_t wait;
+	bool done;
+	s32 status;
+	u32 addr_count;
+	struct tc_net_resolve_addr addrs[TC_NET_RESOLVE_MAX_ADDRS];
+	struct hlist_node node;
+};
 
 #ifdef CONFIG_DEBUG_FS
 static struct dentry *tc_debugfs_dir;
@@ -61,6 +83,14 @@ static int tc_debugfs_net_show(struct seq_file *s, void *unused)
 	seq_printf(s, "in_bad_desc %lld\n", atomic64_read(&tc_in_bad_desc));
 	seq_printf(s, "in_bad_bounds %lld\n", atomic64_read(&tc_in_bad_bounds));
 	seq_printf(s, "in_unknown_type %lld\n", atomic64_read(&tc_in_unknown_type));
+	seq_printf(s, "resolve_completed %lld\n",
+		   atomic64_read(&tc_resolve_completed));
+	seq_printf(s, "resolve_timeouts %lld\n",
+		   atomic64_read(&tc_resolve_timeouts));
+	seq_printf(s, "resolve_dropped %lld\n",
+		   atomic64_read(&tc_resolve_dropped));
+	seq_printf(s, "resolve_pending %d\n",
+		   atomic_read(&tc_resolve_pending_count));
 	return 0;
 }
 
@@ -102,6 +132,8 @@ static unsigned int tc_max_payload = 64 * 1024;
 static unsigned int tc_ring_spin_us = 50;   /* busy-wait before sleeping */
 static unsigned int tc_ring_poll_us = 1000; /* periodic wake when blocked */
 static unsigned int tc_rx_poll_us = 1000;   /* periodic wake for rx thread */
+static unsigned int tc_resolve_timeout_ms = 5000;
+static unsigned int tc_resolve_pending_max = 1024;
 
 module_param(tc_out_desc_count, uint, 0644);
 module_param(tc_in_desc_count, uint, 0644);
@@ -111,10 +143,254 @@ module_param(tc_max_payload, uint, 0644);
 module_param(tc_ring_spin_us, uint, 0644);
 module_param(tc_ring_poll_us, uint, 0644);
 module_param(tc_rx_poll_us, uint, 0644);
+module_param(tc_resolve_timeout_ms, uint, 0644);
+module_param(tc_resolve_pending_max, uint, 0644);
 
 MODULE_PARM_DESC(tc_ring_spin_us, "Spin (usec) before blocking on full ring");
 MODULE_PARM_DESC(tc_ring_poll_us, "Blocked ring polling interval (usec), 0=disable");
 MODULE_PARM_DESC(tc_rx_poll_us, "Rx thread polling interval (usec), 0=disable");
+MODULE_PARM_DESC(tc_resolve_timeout_ms, "Default timeout (ms) for TC_NET_IOC_RESOLVE");
+MODULE_PARM_DESC(tc_resolve_pending_max, "Maximum in-flight TC_NET_IOC_RESOLVE requests");
+
+static struct tc_resolve_pending_request *tc_resolve_find_locked(u64 req_id)
+{
+	struct tc_resolve_pending_request *pending;
+
+	hash_for_each_possible(tc_resolve_pending, pending, node, req_id) {
+		if (pending->req_id == req_id)
+			return pending;
+	}
+	return NULL;
+}
+
+static void tc_resolve_parse_addrs(const void *data, u32 data_len,
+				   struct tc_net_resolve_addr *out,
+				   u32 *out_count)
+{
+	const u8 *buf = data;
+	u32 start = 0;
+	u32 count = 0;
+
+	if (!data || !data_len) {
+		*out_count = 0;
+		return;
+	}
+
+	while (start < data_len && count < TC_NET_RESOLVE_MAX_ADDRS) {
+		u32 end = start;
+		u32 tok_len;
+		char token[INET6_ADDRSTRLEN + 2];
+		u8 v4[4];
+		u8 v6[16];
+
+		while (end < data_len && buf[end] != '\n')
+			end++;
+
+		tok_len = end - start;
+		while (tok_len > 0 && buf[start + tok_len - 1] == '\r')
+			tok_len--;
+		if (tok_len > 0 && tok_len < sizeof(token)) {
+			memcpy(token, buf + start, tok_len);
+			token[tok_len] = '\0';
+			if (in4_pton(token, -1, v4, -1, NULL)) {
+				out[count].family = AF_INET;
+				out[count].reserved = 0;
+				memset(out[count].addr, 0, sizeof(out[count].addr));
+				memcpy(out[count].addr, v4, sizeof(v4));
+				count++;
+			} else if (in6_pton(token, -1, v6, -1, NULL)) {
+				out[count].family = AF_INET6;
+				out[count].reserved = 0;
+				memcpy(out[count].addr, v6, sizeof(v6));
+				count++;
+			}
+		}
+
+		if (end == data_len)
+			break;
+		start = end + 1;
+	}
+
+	*out_count = count;
+}
+
+static void tc_resolve_complete(const struct tc_net_desc *desc,
+				const void *data,
+				u32 data_len)
+{
+	struct tc_net_resolve_addr parsed[TC_NET_RESOLVE_MAX_ADDRS];
+	struct tc_resolve_pending_request *pending;
+	unsigned long flags;
+	u32 parsed_count = 0;
+	s32 status;
+
+	if (!desc->req_id)
+		return;
+
+	if (desc->status > MAX_ERRNO)
+		status = EPROTO;
+	else
+		status = (s32)desc->status;
+
+	if (status == 0 && data && data_len)
+		tc_resolve_parse_addrs(data, data_len, parsed, &parsed_count);
+
+	spin_lock_irqsave(&tc_resolve_lock, flags);
+	pending = tc_resolve_find_locked(desc->req_id);
+	if (!pending) {
+		spin_unlock_irqrestore(&tc_resolve_lock, flags);
+		atomic64_inc(&tc_resolve_dropped);
+		pr_debug_ratelimited("trustcore-net: dropped resolve response req_id=%llu (no pending waiter)\n",
+				     (unsigned long long)desc->req_id);
+		return;
+	}
+
+	pending->status = status;
+	pending->addr_count = min(parsed_count, (u32)TC_NET_RESOLVE_MAX_ADDRS);
+	if (pending->addr_count > 0)
+		memcpy(pending->addrs, parsed,
+		       pending->addr_count * sizeof(parsed[0]));
+	WRITE_ONCE(pending->done, true);
+	spin_unlock_irqrestore(&tc_resolve_lock, flags);
+
+	atomic64_inc(&tc_resolve_completed);
+	wake_up_interruptible(&pending->wait);
+}
+
+static void tc_resolve_abort_all(s32 status)
+{
+	struct tc_resolve_pending_request *pending;
+	unsigned long flags;
+	int bkt;
+
+	spin_lock_irqsave(&tc_resolve_lock, flags);
+	hash_for_each(tc_resolve_pending, bkt, pending, node) {
+		pending->status = status;
+		pending->addr_count = 0;
+		WRITE_ONCE(pending->done, true);
+		wake_up_interruptible(&pending->wait);
+	}
+	spin_unlock_irqrestore(&tc_resolve_lock, flags);
+}
+
+static long tc_device_ioctl_resolve(unsigned long arg)
+{
+	struct tc_resolve_pending_request *pending = NULL;
+	struct tc_net_resolve resolve;
+	struct tc_net_desc desc = {};
+	unsigned long flags;
+	u64 req_id;
+	long wait_rc;
+	u32 timeout_ms;
+	size_t host_len;
+	int rc = 0;
+	u32 addr_count = 0;
+	s32 status = 0;
+	struct tc_net_resolve_addr addrs[TC_NET_RESOLVE_MAX_ADDRS];
+
+	if (copy_from_user(&resolve, (void __user *)arg, sizeof(resolve)))
+		return -EFAULT;
+
+	if (!trustcore_net_ready())
+		return -ENODEV;
+
+	if (resolve.req.flags != TC_NET_RESOLVE_F_NONE)
+		return -EINVAL;
+
+	if (resolve.req.family != AF_UNSPEC && resolve.req.family != AF_INET &&
+	    resolve.req.family != AF_INET6)
+		return -EINVAL;
+
+	host_len = strnlen(resolve.req.hostname, sizeof(resolve.req.hostname));
+	if (host_len == 0 || host_len >= sizeof(resolve.req.hostname))
+		return -EINVAL;
+
+	pending = kzalloc(sizeof(*pending), GFP_KERNEL);
+	if (!pending)
+		return -ENOMEM;
+	init_waitqueue_head(&pending->wait);
+
+	req_id = (u64)atomic64_inc_return(&tc_resolve_next_req_id);
+	if (req_id == 0)
+		req_id = (u64)atomic64_inc_return(&tc_resolve_next_req_id);
+	pending->req_id = req_id;
+	pending->status = EIO;
+
+	spin_lock_irqsave(&tc_resolve_lock, flags);
+	if (atomic_read(&tc_resolve_pending_count) >=
+	    (int)max_t(unsigned int, 1, tc_resolve_pending_max)) {
+		spin_unlock_irqrestore(&tc_resolve_lock, flags);
+		kfree(pending);
+		return -EBUSY;
+	}
+	hash_add(tc_resolve_pending, &pending->node, pending->req_id);
+	atomic_inc(&tc_resolve_pending_count);
+	spin_unlock_irqrestore(&tc_resolve_lock, flags);
+
+	desc.type = TC_NET_DESC_GETRESOLVEHOSTNAME;
+	desc.req_id = pending->req_id;
+	desc.credit = resolve.req.family;
+	rc = trustcore_net_send_desc(&desc, resolve.req.hostname, (u32)host_len,
+				     NULL, 0, false);
+	if (rc) {
+		spin_lock_irqsave(&tc_resolve_lock, flags);
+		if (!hlist_unhashed(&pending->node)) {
+			hash_del_init(&pending->node);
+			atomic_dec(&tc_resolve_pending_count);
+		}
+		spin_unlock_irqrestore(&tc_resolve_lock, flags);
+		kfree(pending);
+		return rc;
+	}
+
+	timeout_ms = resolve.req.timeout_ms;
+	if (timeout_ms == 0)
+		timeout_ms = max_t(unsigned int, 1, tc_resolve_timeout_ms);
+
+	wait_rc = wait_event_interruptible_timeout(
+		pending->wait,
+		READ_ONCE(pending->done) || !trustcore_net_ready(),
+		msecs_to_jiffies(timeout_ms));
+	if (wait_rc < 0) {
+		rc = (int)wait_rc;
+		goto out_remove;
+	}
+
+	spin_lock_irqsave(&tc_resolve_lock, flags);
+	if (READ_ONCE(pending->done)) {
+		status = pending->status;
+		addr_count = min(pending->addr_count,
+				 (u32)TC_NET_RESOLVE_MAX_ADDRS);
+		if (addr_count)
+			memcpy(addrs, pending->addrs,
+			       addr_count * sizeof(addrs[0]));
+	} else if (!trustcore_net_ready()) {
+		status = ENETDOWN;
+	} else {
+		status = ETIMEDOUT;
+		atomic64_inc(&tc_resolve_timeouts);
+	}
+	spin_unlock_irqrestore(&tc_resolve_lock, flags);
+
+	memset(&resolve.resp, 0, sizeof(resolve.resp));
+	resolve.resp.status = status;
+	resolve.resp.addr_count = addr_count;
+	if (addr_count)
+		memcpy(resolve.resp.addrs, addrs, addr_count * sizeof(addrs[0]));
+
+	if (copy_to_user((void __user *)arg, &resolve, sizeof(resolve)))
+		rc = -EFAULT;
+
+out_remove:
+	spin_lock_irqsave(&tc_resolve_lock, flags);
+	if (!hlist_unhashed(&pending->node)) {
+		hash_del_init(&pending->node);
+		atomic_dec(&tc_resolve_pending_count);
+	}
+	spin_unlock_irqrestore(&tc_resolve_lock, flags);
+	kfree(pending);
+	return rc;
+}
 
 static u32 tc_ring_header_size(void)
 {
@@ -541,6 +817,7 @@ static bool tc_desc_validate_in(const struct tc_ring *ring,
 	case TC_NET_DESC_DGRAM_BIND_RESP:
 	case TC_NET_DESC_DGRAM_CONNECT_RESP:
 	case TC_NET_DESC_DGRAM_RECV:
+	case TC_NET_DESC_GETRESOLVEHOSTNAME_RESP:
 		break;
 	default:
 		atomic64_inc(&tc_in_unknown_type);
@@ -605,6 +882,17 @@ static bool tc_desc_validate_in(const struct tc_ring *ring,
 			return false;
 		}
 		if (!tc_aux_sockaddr_valid(ring, d)) {
+			atomic64_inc(&tc_in_bad_desc);
+			return false;
+		}
+		break;
+	case TC_NET_DESC_GETRESOLVEHOSTNAME_RESP:
+		if (!d->req_id || d->listener_id || d->aux_len ||
+		    d->status > MAX_ERRNO) {
+			atomic64_inc(&tc_in_bad_desc);
+			return false;
+		}
+		if (d->data_len > ring->hdr->max_payload) {
 			atomic64_inc(&tc_in_bad_desc);
 			return false;
 		}
@@ -818,6 +1106,17 @@ static int tc_rx_thread(void *arg)
 					eventfd_signal(tc_ctx.in_eventfd);
 				continue;
 			}
+			if (desc.type == TC_NET_DESC_GETRESOLVEHOSTNAME_RESP) {
+				tc_resolve_complete(
+					&desc,
+					desc.data_len
+						? tc_ctx.ring_in.data + desc.data_off
+						: NULL,
+					desc.data_len);
+				if (tc_ctx.in_eventfd)
+					eventfd_signal(tc_ctx.in_eventfd);
+				continue;
+			}
 
 			if (desc.data_len) {
 				data_buf = kmalloc(desc.data_len, GFP_KERNEL);
@@ -884,6 +1183,7 @@ static int tc_device_release(struct inode *inode, struct file *file)
 		trustcore_net_set_intercept(&req);
 		trustcore_net_cgroup_clear();
 	}
+	tc_resolve_abort_all(ENETDOWN);
 	wake_up_all(&tc_ctx.ring_out.wait);
 	wake_up_all(&tc_ctx.ring_in.wait);
 	trustcore_sock_abort_all(ENETDOWN);
@@ -1060,6 +1360,9 @@ static long tc_device_ioctl(struct file *file, unsigned int cmd, unsigned long a
 		if (!rc && copy_to_user((void __user *)arg, &ic, sizeof(ic)))
 			rc = -EFAULT;
 		break;
+	case TC_NET_IOC_RESOLVE:
+		mutex_unlock(&tc_ctx.lock);
+		return tc_device_ioctl_resolve(arg);
 	default:
 		rc = -ENOIOCTLCMD;
 		break;
@@ -1165,6 +1468,8 @@ static int __init trustcore_net_init(void)
 	int rc;
 
 	mutex_init(&tc_ctx.lock);
+	hash_init(tc_resolve_pending);
+	atomic_set(&tc_resolve_pending_count, 0);
 	rc = misc_register(&tc_device);
 	if (rc)
 		return rc;

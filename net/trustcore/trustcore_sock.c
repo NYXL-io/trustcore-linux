@@ -739,7 +739,7 @@ static void tc_handle_inbound(const struct tc_net_desc *desc,
 		return;
 	}
 	case TC_NET_DESC_GETRESOLVEHOSTNAME_RESP:
-		pr_warn_ratelimited("trustcore_sock: dropping GETRESOLVEHOSTNAME_RESP req_id=%llu stream_id=%llu (kernel resolver response path not wired)\n",
+		pr_warn_ratelimited("trustcore_sock: unexpected GETRESOLVEHOSTNAME_RESP req_id=%llu stream_id=%llu (should be handled in trustcore_net)\n",
 				    (unsigned long long)desc->req_id,
 				    (unsigned long long)desc->stream_id);
 		kfree(data);
