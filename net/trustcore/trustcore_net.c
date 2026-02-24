@@ -335,7 +335,7 @@ static long tc_device_ioctl_resolve(unsigned long arg)
 	if (rc) {
 		spin_lock_irqsave(&tc_resolve_lock, flags);
 		if (!hlist_unhashed(&pending->node)) {
-			hash_del_init(&pending->node);
+			hlist_del_init(&pending->node);
 			atomic_dec(&tc_resolve_pending_count);
 		}
 		spin_unlock_irqrestore(&tc_resolve_lock, flags);
@@ -384,7 +384,7 @@ static long tc_device_ioctl_resolve(unsigned long arg)
 out_remove:
 	spin_lock_irqsave(&tc_resolve_lock, flags);
 	if (!hlist_unhashed(&pending->node)) {
-		hash_del_init(&pending->node);
+		hlist_del_init(&pending->node);
 		atomic_dec(&tc_resolve_pending_count);
 	}
 	spin_unlock_irqrestore(&tc_resolve_lock, flags);
