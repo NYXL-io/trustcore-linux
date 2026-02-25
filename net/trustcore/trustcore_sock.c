@@ -119,6 +119,8 @@ struct tc_accept_entry {
 	u64 stream_id;
 	struct sockaddr_storage peer;
 	int peer_len;
+	struct tc_net_conn_meta conn_meta;
+	bool conn_meta_valid;
 	struct hlist_node node;
 };
 
@@ -139,6 +141,9 @@ struct tc_sock {
 	int peer_len;
 	struct sockaddr_storage local;
 	int local_len;
+	struct tc_net_sock_policy policy;
+	struct tc_net_conn_meta conn_meta;
+	bool conn_meta_valid;
 	wait_queue_head_t wait;
 	spinlock_t rx_lock;
 	struct list_head rx_queue;
@@ -510,6 +515,181 @@ static bool tc_local_sockaddr_valid(const struct sock *sk, const void *aux,
 	return false;
 }
 
+static bool tc_sockaddr_blob_valid(const void *addr, u32 addr_len)
+{
+	if (!addr || !addr_len)
+		return false;
+	if (addr_len == sizeof(struct sockaddr_in)) {
+		const struct sockaddr_in *sin = addr;
+
+		return sin->sin_family == AF_INET;
+	}
+	if (addr_len == sizeof(struct sockaddr_in6)) {
+		const struct sockaddr_in6 *sin6 = addr;
+
+		return sin6->sin6_family == AF_INET6;
+	}
+	return false;
+}
+
+static void tc_conn_meta_reset(struct tc_net_conn_meta *meta)
+{
+	if (!meta)
+		return;
+	memset(meta, 0, sizeof(*meta));
+	meta->channel_class = TC_NET_CHANNEL_EXTERNAL;
+}
+
+static void tc_policy_reset(struct tc_net_sock_policy *policy)
+{
+	if (!policy)
+		return;
+	memset(policy, 0, sizeof(*policy));
+	policy->outbound = TC_NET_POLICY_OUT_DEFAULT;
+	policy->inbound = TC_NET_POLICY_IN_DEFAULT;
+}
+
+static void tc_policy_normalize(struct tc_net_sock_policy *policy)
+{
+	if (!policy)
+		return;
+
+	switch (policy->outbound) {
+	case TC_NET_POLICY_OUT_DEFAULT:
+	case TC_NET_POLICY_OUT_EXTERNAL_ONLY:
+	case TC_NET_POLICY_OUT_SECURE_REQUIRED:
+		break;
+	default:
+		policy->outbound = TC_NET_POLICY_OUT_DEFAULT;
+		break;
+	}
+
+	switch (policy->inbound) {
+	case TC_NET_POLICY_IN_DEFAULT:
+	case TC_NET_POLICY_IN_EXTERNAL_ONLY:
+	case TC_NET_POLICY_IN_SECURE_ONLY:
+	case TC_NET_POLICY_IN_BOTH:
+		break;
+	default:
+		policy->inbound = TC_NET_POLICY_IN_DEFAULT;
+		break;
+	}
+	memset(policy->reserved, 0, sizeof(policy->reserved));
+}
+
+static void tc_conn_meta_normalize(struct tc_net_conn_meta *meta)
+{
+	if (!meta)
+		return;
+
+	if (meta->channel_class != TC_NET_CHANNEL_EXTERNAL &&
+	    meta->channel_class != TC_NET_CHANNEL_SECURE)
+		meta->channel_class = TC_NET_CHANNEL_EXTERNAL;
+}
+
+static bool tc_parse_addr_and_meta(const void *aux, u32 aux_len,
+				   const void **out_addr, u32 *out_addr_len,
+				   const struct tc_net_conn_meta **out_meta)
+{
+	const void *addr = NULL;
+	u32 addr_len = 0;
+	const struct tc_net_conn_meta *meta = NULL;
+
+	if (out_addr)
+		*out_addr = NULL;
+	if (out_addr_len)
+		*out_addr_len = 0;
+	if (out_meta)
+		*out_meta = NULL;
+
+	if (!aux || !aux_len)
+		return true;
+
+	if (aux_len == sizeof(struct tc_net_addr_meta_aux)) {
+		const struct tc_net_addr_meta_aux *payload = aux;
+
+		if (payload->addr_len > TC_NET_AUX_ADDR_MAX)
+			return false;
+		if (payload->addr_len) {
+			if (!tc_sockaddr_blob_valid(payload->addr, payload->addr_len))
+				return false;
+			addr = payload->addr;
+			addr_len = payload->addr_len;
+		}
+		meta = &payload->meta;
+		goto done;
+	}
+
+	if (aux_len == sizeof(struct tc_net_conn_meta)) {
+		meta = aux;
+		goto done;
+	}
+
+	if (aux_len == sizeof(struct tc_net_conn_meta) + sizeof(struct sockaddr_in)) {
+		const struct tc_net_conn_meta *m = aux;
+		const void *sa = (const u8 *)aux + sizeof(*m);
+
+		if (!tc_sockaddr_blob_valid(sa, sizeof(struct sockaddr_in)))
+			return false;
+		meta = m;
+		addr = sa;
+		addr_len = sizeof(struct sockaddr_in);
+		goto done;
+	}
+	if (aux_len == sizeof(struct tc_net_conn_meta) + sizeof(struct sockaddr_in6)) {
+		const struct tc_net_conn_meta *m = aux;
+		const void *sa = (const u8 *)aux + sizeof(*m);
+
+		if (!tc_sockaddr_blob_valid(sa, sizeof(struct sockaddr_in6)))
+			return false;
+		meta = m;
+		addr = sa;
+		addr_len = sizeof(struct sockaddr_in6);
+		goto done;
+	}
+
+	if (aux_len == sizeof(struct sockaddr_in) + sizeof(struct tc_net_conn_meta)) {
+		const void *sa = aux;
+		const struct tc_net_conn_meta *m =
+			(const struct tc_net_conn_meta *)((const u8 *)aux +
+						     sizeof(struct sockaddr_in));
+
+		if (!tc_sockaddr_blob_valid(sa, sizeof(struct sockaddr_in)))
+			return false;
+		meta = m;
+		addr = sa;
+		addr_len = sizeof(struct sockaddr_in);
+		goto done;
+	}
+	if (aux_len == sizeof(struct sockaddr_in6) + sizeof(struct tc_net_conn_meta)) {
+		const void *sa = aux;
+		const struct tc_net_conn_meta *m =
+			(const struct tc_net_conn_meta *)((const u8 *)aux +
+						     sizeof(struct sockaddr_in6));
+
+		if (!tc_sockaddr_blob_valid(sa, sizeof(struct sockaddr_in6)))
+			return false;
+		meta = m;
+		addr = sa;
+		addr_len = sizeof(struct sockaddr_in6);
+		goto done;
+	}
+
+	if (!tc_sockaddr_blob_valid(aux, aux_len))
+		return false;
+	addr = aux;
+	addr_len = aux_len;
+
+done:
+	if (out_addr)
+		*out_addr = addr;
+	if (out_addr_len)
+		*out_addr_len = addr_len;
+	if (out_meta)
+		*out_meta = meta;
+	return true;
+}
+
 void trustcore_sock_abort_all(int err)
 {
 	struct tc_sock *tc;
@@ -567,25 +747,44 @@ static void tc_handle_inbound(const struct tc_net_desc *desc,
 	case TC_NET_DESC_CONNECT_RESP: {
 		struct sock *sk = tc_find_request_sk(desc->req_id);
 		struct tc_sock *tc;
+		const void *addr = NULL;
+		u32 addr_len = 0;
+		const struct tc_net_conn_meta *meta = NULL;
 		if (!sk) {
 			kfree(data);
 			kfree(aux);
 			return;
 		}
 		tc = tc_sk(sk);
+		if (!tc_parse_addr_and_meta(aux, aux_len, &addr, &addr_len, &meta)) {
+			tc_complete_request(tc, EPROTO);
+			sock_put(sk);
+			kfree(data);
+			kfree(aux);
+			return;
+		}
 		if (desc->status == 0) {
 			if (desc->stream_id && desc->stream_id != tc->stream_id)
 				tc->stream_id = desc->stream_id;
 			tc_register_stream(tc);
 			tc->inet.sk.sk_state = TCP_ESTABLISHED;
-			if (tc_local_sockaddr_valid(sk, aux, aux_len)) {
-				memcpy(&tc->local, aux, aux_len);
-				tc->local_len = aux_len;
+			if (tc_local_sockaddr_valid(sk, addr, addr_len)) {
+				memcpy(&tc->local, addr, addr_len);
+				tc->local_len = addr_len;
 			}
+			if (meta) {
+				tc->conn_meta = *meta;
+				tc_conn_meta_normalize(&tc->conn_meta);
+			} else {
+				tc_conn_meta_reset(&tc->conn_meta);
+			}
+			tc->conn_meta_valid = true;
 		} else {
 			tc->peer_len = 0;
 			tc->closing = true;
 			tc->inet.sk.sk_state = TCP_CLOSE;
+			tc_conn_meta_reset(&tc->conn_meta);
+			tc->conn_meta_valid = false;
 		}
 		tc_complete_request(tc, desc->status);
 		sock_put(sk);
@@ -675,8 +874,18 @@ static void tc_handle_inbound(const struct tc_net_desc *desc,
 		struct sock *lsk = tc_find_listener_sk(desc->listener_id);
 		struct tc_sock *listener;
 		struct tc_accept_entry *entry;
+		const void *peer_addr = NULL;
+		u32 peer_addr_len = 0;
+		const struct tc_net_conn_meta *meta = NULL;
 
 		if (!lsk) {
+			kfree(data);
+			kfree(aux);
+			return;
+		}
+		if (!tc_parse_addr_and_meta(aux, aux_len, &peer_addr, &peer_addr_len,
+					    &meta)) {
+			sock_put(lsk);
 			kfree(data);
 			kfree(aux);
 			return;
@@ -694,10 +903,17 @@ static void tc_handle_inbound(const struct tc_net_desc *desc,
 		entry->rx_queued_bytes = 0;
 		entry->rx_queued_bufs = 0;
 		INIT_HLIST_NODE(&entry->node);
-		if (aux && (aux_len == sizeof(struct sockaddr_in) ||
-			    aux_len == sizeof(struct sockaddr_in6))) {
-			memcpy(&entry->peer, aux, aux_len);
-			entry->peer_len = aux_len;
+		if (peer_addr && peer_addr_len) {
+			memcpy(&entry->peer, peer_addr, peer_addr_len);
+			entry->peer_len = peer_addr_len;
+		}
+		if (meta) {
+			entry->conn_meta = *meta;
+			tc_conn_meta_normalize(&entry->conn_meta);
+			entry->conn_meta_valid = true;
+		} else {
+			tc_conn_meta_reset(&entry->conn_meta);
+			entry->conn_meta_valid = true;
 		}
 		spin_lock(&tc_pending_accepts_lock);
 		hash_add(tc_pending_accepts, &entry->node, entry->stream_id);
@@ -809,6 +1025,9 @@ static int trustcore_init_sock(struct sock *sk)
 	tc->dgram_host_ready = false;
 	tc->peer_len = 0;
 	tc->local_len = 0;
+	tc_policy_reset(&tc->policy);
+	tc_conn_meta_reset(&tc->conn_meta);
+	tc->conn_meta_valid = false;
 	init_waitqueue_head(&tc->wait);
 	spin_lock_init(&tc->rx_lock);
 	INIT_LIST_HEAD(&tc->rx_queue);
@@ -1020,6 +1239,7 @@ static int trustcore_connect(struct socket *sock, struct sockaddr *addr,
 		struct tc_net_origin origin;
 		struct sockaddr_storage sa;
 	} auxbuf;
+	struct tc_net_policy_aux policy_aux = {};
 	bool nonblock = flags & O_NONBLOCK;
 	long timeout;
 	long wait_rc;
@@ -1129,6 +1349,8 @@ static int trustcore_connect(struct socket *sock, struct sockaddr *addr,
 	tc->peer_len = addr_len;
 	tc->pending_status = 0;
 	sk->sk_err = 0;
+	tc_conn_meta_reset(&tc->conn_meta);
+	tc->conn_meta_valid = false;
 
 	if (!tc->stream_id)
 		tc->stream_id = atomic64_inc_return(&tc_next_stream_id);
@@ -1136,16 +1358,21 @@ static int trustcore_connect(struct socket *sock, struct sockaddr *addr,
 	desc.stream_id = tc->stream_id;
 	desc.req_id = atomic64_inc_return(&tc_next_req_id);
 	desc.status = 0;
-	desc.flags = TC_NET_DESC_F_ORIGIN;
-	auxbuf.origin.tgid = (u32)current->tgid;
-	auxbuf.origin.uid = (u32)from_kuid_munged(current_user_ns(), current_uid());
-	auxbuf.origin.gid = (u32)from_kgid_munged(current_user_ns(), current_gid());
-	auxbuf.origin.reserved = 0;
-	memset(&auxbuf.sa, 0, sizeof(auxbuf.sa));
-	memcpy(&auxbuf.sa, addr, addr_len);
+	desc.flags = TC_NET_DESC_F_ORIGIN | TC_NET_DESC_F_POLICY;
+	policy_aux.origin.tgid = (u32)current->tgid;
+	policy_aux.origin.uid = (u32)from_kuid_munged(current_user_ns(), current_uid());
+	policy_aux.origin.gid = (u32)from_kgid_munged(current_user_ns(), current_gid());
+	policy_aux.origin.reserved = 0;
+	policy_aux.policy = tc->policy;
+	tc_policy_normalize(&policy_aux.policy);
+	policy_aux.addr_len = addr_len;
+	policy_aux.reserved = 0;
+	memset(policy_aux.addr, 0, sizeof(policy_aux.addr));
+	memcpy(policy_aux.addr, addr, addr_len);
 
 	tc_register_request(tc, desc.req_id);
-	rc = trustcore_net_send_desc(&desc, NULL, 0, &auxbuf, sizeof(auxbuf.origin) + addr_len, nonblock);
+	rc = trustcore_net_send_desc(&desc, NULL, 0, &policy_aux,
+				     sizeof(policy_aux), nonblock);
 	if (rc) {
 		tc_unregister_request(tc);
 		tc->peer_len = 0;
@@ -1184,10 +1411,7 @@ static int trustcore_listen(struct socket *sock, int backlog)
 	struct sock *sk = sock->sk;
 	struct tc_sock *tc = tc_sk(sk);
 	struct tc_net_desc desc = {};
-	struct {
-		struct tc_net_origin origin;
-		struct sockaddr_storage sa;
-	} auxbuf;
+	struct tc_net_policy_aux policy_aux = {};
 	long timeout;
 	long wait_rc;
 	int rc;
@@ -1238,7 +1462,7 @@ static int trustcore_listen(struct socket *sock, int backlog)
 	desc.type = TC_NET_DESC_LISTEN;
 	desc.stream_id = tc->listener_id;
 	desc.req_id = atomic64_inc_return(&tc_next_req_id);
-	desc.flags = TC_NET_DESC_F_ORIGIN;
+	desc.flags = TC_NET_DESC_F_ORIGIN | TC_NET_DESC_F_POLICY;
 	{
 		int bl = backlog;
 
@@ -1248,15 +1472,22 @@ static int trustcore_listen(struct socket *sock, int backlog)
 			bl = SOMAXCONN;
 		desc.credit = (u32)bl;
 	}
-	auxbuf.origin.tgid = (u32)current->tgid;
-	auxbuf.origin.uid = (u32)from_kuid_munged(current_user_ns(), current_uid());
-	auxbuf.origin.gid = (u32)from_kgid_munged(current_user_ns(), current_gid());
-	auxbuf.origin.reserved = 0;
-	memset(&auxbuf.sa, 0, sizeof(auxbuf.sa));
-	memcpy(&auxbuf.sa, &tc->local, tc->local_len);
+	policy_aux.origin.tgid = (u32)current->tgid;
+	policy_aux.origin.uid =
+		(u32)from_kuid_munged(current_user_ns(), current_uid());
+	policy_aux.origin.gid =
+		(u32)from_kgid_munged(current_user_ns(), current_gid());
+	policy_aux.origin.reserved = 0;
+	policy_aux.policy = tc->policy;
+	tc_policy_normalize(&policy_aux.policy);
+	policy_aux.addr_len = tc->local_len;
+	policy_aux.reserved = 0;
+	memset(policy_aux.addr, 0, sizeof(policy_aux.addr));
+	memcpy(policy_aux.addr, &tc->local, tc->local_len);
 
 	tc_register_request(tc, desc.req_id);
-	rc = trustcore_net_send_desc(&desc, NULL, 0, &auxbuf, sizeof(auxbuf.origin) + tc->local_len, false);
+	rc = trustcore_net_send_desc(&desc, NULL, 0, &policy_aux,
+				     sizeof(policy_aux), false);
 	if (rc) {
 		tc_unregister_request(tc);
 		return rc;
@@ -1346,6 +1577,7 @@ static int trustcore_accept(struct socket *sock, struct socket *newsock,
 	child->stream_id = entry->stream_id;
 	child->listening = false;
 	child->inet.sk.sk_state = TCP_ESTABLISHED;
+	child->policy = listener->policy;
 	if (entry->peer_len) {
 		memcpy(&child->peer, &entry->peer, entry->peer_len);
 		child->peer_len = entry->peer_len;
@@ -1353,6 +1585,14 @@ static int trustcore_accept(struct socket *sock, struct socket *newsock,
 	if (listener->local_len) {
 		memcpy(&child->local, &listener->local, listener->local_len);
 		child->local_len = listener->local_len;
+	}
+	if (entry->conn_meta_valid) {
+		child->conn_meta = entry->conn_meta;
+		tc_conn_meta_normalize(&child->conn_meta);
+		child->conn_meta_valid = true;
+	} else {
+		tc_conn_meta_reset(&child->conn_meta);
+		child->conn_meta_valid = false;
 	}
 	tc_register_stream(child);
 	{
@@ -1478,10 +1718,29 @@ static int trustcore_setsockopt(struct socket *sock, int level, int optname,
 				sockptr_t optval, unsigned int optlen)
 {
 	struct sock *sk = sock->sk;
+	struct tc_sock *tc = tc_sk(sk);
 	struct linger ling;
+	struct tc_net_sock_policy policy;
 	int val;
 	int valbool;
 	int ret = 0;
+
+	if (level == SOL_TRUSTCORE) {
+		switch (optname) {
+		case TC_SO_POLICY:
+			if (optlen < sizeof(policy))
+				return -EINVAL;
+			if (copy_from_sockptr(&policy, optval, sizeof(policy)))
+				return -EFAULT;
+			tc_policy_normalize(&policy);
+			sockopt_lock_sock(sk);
+			tc->policy = policy;
+			sockopt_release_sock(sk);
+			return 0;
+		default:
+			return -ENOPROTOOPT;
+		}
+	}
 
 	if (level != SOL_SOCKET)
 		return -ENOPROTOOPT;
@@ -1561,11 +1820,58 @@ static int trustcore_getsockopt(struct socket *sock, int level, int optname,
 				char __user *optval, int __user *optlen)
 {
 	struct sock *sk = sock->sk;
+	struct tc_sock *tc = tc_sk(sk);
 	struct __kernel_sock_timeval tv;
 	struct linger ling;
 	int len;
 	int err = 0;
 	int val;
+	int user_len;
+
+	if (level == SOL_TRUSTCORE) {
+		if (get_user(user_len, optlen))
+			return -EFAULT;
+		if (user_len < 0)
+			return -EINVAL;
+
+		switch (optname) {
+		case TC_SO_POLICY: {
+			struct tc_net_sock_policy policy;
+
+			if (user_len < sizeof(policy))
+				return -EINVAL;
+			sockopt_lock_sock(sk);
+			policy = tc->policy;
+			tc_policy_normalize(&policy);
+			sockopt_release_sock(sk);
+			if (copy_to_user(optval, &policy, sizeof(policy)))
+				return -EFAULT;
+			if (put_user((int)sizeof(policy), optlen))
+				return -EFAULT;
+			return 0;
+		}
+		case TC_SO_CONN_META: {
+			struct tc_net_conn_meta meta;
+
+			if (user_len < sizeof(meta))
+				return -EINVAL;
+			sockopt_lock_sock(sk);
+			if (tc->conn_meta_valid)
+				meta = tc->conn_meta;
+			else
+				tc_conn_meta_reset(&meta);
+			tc_conn_meta_normalize(&meta);
+			sockopt_release_sock(sk);
+			if (copy_to_user(optval, &meta, sizeof(meta)))
+				return -EFAULT;
+			if (put_user((int)sizeof(meta), optlen))
+				return -EFAULT;
+			return 0;
+		}
+		default:
+			return -ENOPROTOOPT;
+		}
+	}
 
 	if (level != SOL_SOCKET)
 		return -ENOPROTOOPT;

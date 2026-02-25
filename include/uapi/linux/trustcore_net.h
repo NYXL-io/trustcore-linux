@@ -3,9 +3,18 @@
 
 #include <linux/types.h>
 
-#define TRUSTCORE_NET_VERSION 4u
+#define TRUSTCORE_NET_VERSION 5u
 #define TRUSTCORE_NET_MAX_PAYLOAD (256u * 1024u)
-/* Version 2 adds listener_id; version 3 adds UDP descriptors; version 4 adds TC_NET_IOC_RESOLVE. */
+/*
+ * Version 2 adds listener_id.
+ * Version 3 adds UDP descriptors.
+ * Version 4 adds TC_NET_IOC_RESOLVE.
+ * Version 5 adds socket policy + connection metadata APIs.
+ */
+
+#ifndef SOL_TRUSTCORE
+#define SOL_TRUSTCORE 288
+#endif
 
 enum tc_net_desc_type {
 	TC_NET_DESC_CONNECT = 1,
@@ -34,6 +43,51 @@ enum tc_net_desc_flags {
 	 * payload (e.g., sockaddr for CONNECT/LISTEN).
 	 */
 	TC_NET_DESC_F_ORIGIN = 1u << 0,
+	/* Aux buffer includes struct tc_net_sock_policy after tc_net_origin. */
+	TC_NET_DESC_F_POLICY = 1u << 1,
+};
+
+enum tc_so_optname {
+	TC_SO_POLICY = 1,
+	TC_SO_CONN_META = 2,
+};
+
+enum tc_net_policy_outbound {
+	TC_NET_POLICY_OUT_DEFAULT = 0,
+	TC_NET_POLICY_OUT_EXTERNAL_ONLY = 1,
+	TC_NET_POLICY_OUT_SECURE_REQUIRED = 2,
+};
+
+enum tc_net_policy_inbound {
+	TC_NET_POLICY_IN_DEFAULT = 0,
+	TC_NET_POLICY_IN_EXTERNAL_ONLY = 1,
+	TC_NET_POLICY_IN_SECURE_ONLY = 2,
+	TC_NET_POLICY_IN_BOTH = 3,
+};
+
+enum tc_net_channel_class {
+	TC_NET_CHANNEL_EXTERNAL = 0,
+	TC_NET_CHANNEL_SECURE = 1,
+};
+
+#define TC_NET_AUX_ADDR_MAX 128u
+#define TC_NET_ID_MAX_LEN 96u
+
+struct tc_net_sock_policy {
+	__u32 outbound;
+	__u32 inbound;
+	__u32 reserved[2];
+};
+
+struct tc_net_conn_meta {
+	__u32 channel_class;
+	__u32 flags;
+	__u64 tx_counter;
+	__u64 rx_counter;
+	__u8 session_id[16];
+	char source_service_id[TC_NET_ID_MAX_LEN];
+	char target_service_id[TC_NET_ID_MAX_LEN];
+	char peer_id[TC_NET_ID_MAX_LEN];
 };
 
 /*
@@ -45,12 +99,16 @@ enum tc_net_desc_flags {
  * - listener_id: listener handle for ACCEPT (0 otherwise).
  *
  * Type-specific fields:
- * CONNECT: stream_id!=0, req_id!=0, listener_id=0, aux=origin+sockaddr.
- * CONNECT_RESP: req_id!=0, stream_id!=0 on success; aux optional local sockaddr.
+ * CONNECT: stream_id!=0, req_id!=0, listener_id=0, aux=origin+sockaddr
+ *          (legacy) or tc_net_policy_aux when TC_NET_DESC_F_POLICY is set.
+ * CONNECT_RESP: req_id!=0, stream_id!=0 on success; aux optional local
+ *               sockaddr and/or tc_net_conn_meta (tc_net_addr_meta_aux in v5).
  * LISTEN: stream_id!=0, req_id!=0, listener_id=0, credit=backlog,
- *         aux=origin+sockaddr.
- * LISTEN_RESP: req_id!=0, stream_id!=0 on success; aux optional local sockaddr.
- * ACCEPT: listener_id!=0, stream_id!=0, req_id=0; aux optional peer sockaddr.
+ *         aux=origin+sockaddr (legacy) or tc_net_policy_aux (v5).
+ * LISTEN_RESP: req_id!=0, stream_id!=0 on success; aux optional local
+ *              sockaddr.
+ * ACCEPT: listener_id!=0, stream_id!=0, req_id=0; aux optional peer sockaddr
+ *         and/or tc_net_conn_meta (tc_net_addr_meta_aux in v5).
  * SEND: stream_id!=0, data_len>0, aux_len=0.
  * RECV: stream_id!=0, data_len>0, aux_len=0.
  * CLOSE: stream_id!=0, status optional error.
@@ -82,6 +140,28 @@ struct tc_net_origin {
 	__u32 uid;
 	__u32 gid;
 	__u32 reserved;
+};
+
+/*
+ * Fixed-size AUX payloads:
+ * - CONNECT/LISTEN with TC_NET_DESC_F_ORIGIN|TC_NET_DESC_F_POLICY use
+ *   tc_net_policy_aux.
+ * - CONNECT_RESP/ACCEPT may use tc_net_addr_meta_aux to carry peer/local
+ *   sockaddr plus channel metadata.
+ */
+struct tc_net_policy_aux {
+	struct tc_net_origin origin;
+	struct tc_net_sock_policy policy;
+	__u32 addr_len;
+	__u32 reserved;
+	__u8 addr[TC_NET_AUX_ADDR_MAX];
+};
+
+struct tc_net_addr_meta_aux {
+	__u32 addr_len;
+	__u32 reserved;
+	struct tc_net_conn_meta meta;
+	__u8 addr[TC_NET_AUX_ADDR_MAX];
 };
 
 struct tc_net_desc {

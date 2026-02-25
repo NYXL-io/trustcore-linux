@@ -779,26 +779,76 @@ static bool tc_ring_pop(struct tc_ring *ring, struct tc_net_desc *out_desc)
 	return true;
 }
 
+static bool tc_sockaddr_blob_valid(const void *addr, u32 addr_len)
+{
+	if (!addr || !addr_len)
+		return false;
+
+	if (addr_len == sizeof(struct sockaddr_in)) {
+		const struct sockaddr_in *sin = addr;
+
+		return sin->sin_family == AF_INET;
+	}
+	if (addr_len == sizeof(struct sockaddr_in6)) {
+		const struct sockaddr_in6 *sin6 = addr;
+
+		return sin6->sin6_family == AF_INET6;
+	}
+
+	return false;
+}
+
 static bool tc_aux_sockaddr_valid(const struct tc_ring *ring,
 				  const struct tc_net_desc *d)
 {
 	if (!d->aux_len)
 		return true;
 
-	if (d->aux_len == sizeof(struct sockaddr_in)) {
-		struct sockaddr_in sin;
+	return tc_sockaddr_blob_valid(ring->data + d->aux_off, d->aux_len);
+}
 
-		memcpy(&sin, ring->data + d->aux_off, sizeof(sin));
-		return sin.sin_family == AF_INET;
+static bool tc_aux_addr_meta_valid(const struct tc_ring *ring,
+				   const struct tc_net_desc *d)
+{
+	const u8 *aux = ring->data + d->aux_off;
+
+	if (!d->aux_len)
+		return true;
+
+	if (d->aux_len == sizeof(struct tc_net_conn_meta))
+		return true;
+
+	if (d->aux_len == sizeof(struct tc_net_addr_meta_aux)) {
+		const struct tc_net_addr_meta_aux *payload =
+			(const struct tc_net_addr_meta_aux *)aux;
+
+		if (payload->addr_len > TC_NET_AUX_ADDR_MAX)
+			return false;
+		if (!payload->addr_len)
+			return true;
+		return tc_sockaddr_blob_valid(payload->addr, payload->addr_len);
 	}
-	if (d->aux_len == sizeof(struct sockaddr_in6)) {
-		struct sockaddr_in6 sin6;
 
-		memcpy(&sin6, ring->data + d->aux_off, sizeof(sin6));
-		return sin6.sin6_family == AF_INET6;
+	if (d->aux_len ==
+	    sizeof(struct tc_net_conn_meta) + sizeof(struct sockaddr_in)) {
+		return tc_sockaddr_blob_valid(aux + sizeof(struct tc_net_conn_meta),
+					      sizeof(struct sockaddr_in));
+	}
+	if (d->aux_len ==
+	    sizeof(struct tc_net_conn_meta) + sizeof(struct sockaddr_in6)) {
+		return tc_sockaddr_blob_valid(aux + sizeof(struct tc_net_conn_meta),
+					      sizeof(struct sockaddr_in6));
+	}
+	if (d->aux_len ==
+	    sizeof(struct sockaddr_in) + sizeof(struct tc_net_conn_meta)) {
+		return tc_sockaddr_blob_valid(aux, sizeof(struct sockaddr_in));
+	}
+	if (d->aux_len ==
+	    sizeof(struct sockaddr_in6) + sizeof(struct tc_net_conn_meta)) {
+		return tc_sockaddr_blob_valid(aux, sizeof(struct sockaddr_in6));
 	}
 
-	return false;
+	return tc_sockaddr_blob_valid(aux, d->aux_len);
 }
 
 static bool tc_desc_validate_in(const struct tc_ring *ring,
@@ -869,6 +919,20 @@ static bool tc_desc_validate_in(const struct tc_ring *ring,
 		}
 		break;
 	case TC_NET_DESC_CONNECT_RESP:
+		if (!d->req_id || d->listener_id || d->data_len ||
+		    d->status > MAX_ERRNO) {
+			atomic64_inc(&tc_in_bad_desc);
+			return false;
+		}
+		if (!d->status && !d->stream_id) {
+			atomic64_inc(&tc_in_bad_desc);
+			return false;
+		}
+		if (!tc_aux_addr_meta_valid(ring, d)) {
+			atomic64_inc(&tc_in_bad_desc);
+			return false;
+		}
+		break;
 	case TC_NET_DESC_LISTEN_RESP:
 	case TC_NET_DESC_DGRAM_BIND_RESP:
 	case TC_NET_DESC_DGRAM_CONNECT_RESP:
@@ -903,7 +967,7 @@ static bool tc_desc_validate_in(const struct tc_ring *ring,
 			atomic64_inc(&tc_in_bad_desc);
 			return false;
 		}
-		if (!tc_aux_sockaddr_valid(ring, d)) {
+		if (!tc_aux_addr_meta_valid(ring, d)) {
 			atomic64_inc(&tc_in_bad_desc);
 			return false;
 		}
