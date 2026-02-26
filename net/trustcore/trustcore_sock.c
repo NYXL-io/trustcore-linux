@@ -12,6 +12,7 @@
 #include <linux/cred.h>
 #include <linux/debugfs.h>
 #include <linux/ipv6.h>
+#include <linux/tcp.h>
 #include <linux/mm.h>
 #include <linux/limits.h>
 #include <linux/printk.h>
@@ -144,6 +145,8 @@ struct tc_sock {
 	struct tc_net_sock_policy policy;
 	struct tc_net_conn_meta conn_meta;
 	bool conn_meta_valid;
+	bool tcp_nodelay;
+	bool tcp_quickack;
 	wait_queue_head_t wait;
 	spinlock_t rx_lock;
 	struct list_head rx_queue;
@@ -1742,6 +1745,37 @@ static int trustcore_setsockopt(struct socket *sock, int level, int optname,
 		}
 	}
 
+	if (level == SOL_TCP || level == IPPROTO_TCP) {
+		/*
+		 * Compatibility with userspace TCP stacks (for example gRPC) that
+		 * set TCP socket options on AF_INET/AF_INET6 stream sockets.
+		 * Trustcore transport is message-ring based, so these are kept as
+		 * local compatibility state only.
+		 */
+		if (optlen < sizeof(int))
+			return -EINVAL;
+		if (copy_from_sockptr(&val, optval, sizeof(int)))
+			return -EFAULT;
+		valbool = !!val;
+
+		sockopt_lock_sock(sk);
+		switch (optname) {
+		case TCP_NODELAY:
+			tc->tcp_nodelay = valbool;
+			ret = 0;
+			break;
+		case TCP_QUICKACK:
+			tc->tcp_quickack = valbool;
+			ret = 0;
+			break;
+		default:
+			ret = -ENOPROTOOPT;
+			break;
+		}
+		sockopt_release_sock(sk);
+		return ret;
+	}
+
 	if (level != SOL_SOCKET)
 		return -ENOPROTOOPT;
 
@@ -1871,6 +1905,27 @@ static int trustcore_getsockopt(struct socket *sock, int level, int optname,
 		default:
 			return -ENOPROTOOPT;
 		}
+	}
+
+	if (level == SOL_TCP || level == IPPROTO_TCP) {
+		switch (optname) {
+		case TCP_NODELAY:
+			val = READ_ONCE(tc->tcp_nodelay);
+			len = sizeof(val);
+			break;
+		case TCP_QUICKACK:
+			val = READ_ONCE(tc->tcp_quickack);
+			len = sizeof(val);
+			break;
+		default:
+			return -ENOPROTOOPT;
+		}
+
+		if (copy_to_user(optval, &val, len))
+			err = -EFAULT;
+		if (put_user(len, optlen))
+			err = -EFAULT;
+		return err;
 	}
 
 	if (level != SOL_SOCKET)
