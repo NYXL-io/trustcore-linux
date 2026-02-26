@@ -1630,6 +1630,31 @@ static int trustcore_accept(struct socket *sock, struct socket *newsock,
 	return 0;
 }
 
+static int tc_getname_default_local(struct socket *sock, struct sockaddr *addr)
+{
+	if (sock->ops->family == PF_INET) {
+		struct sockaddr_in sin = {};
+
+		sin.sin_family = AF_INET;
+		sin.sin_addr.s_addr = htonl(INADDR_ANY);
+		sin.sin_port = 0;
+		memcpy(addr, &sin, sizeof(sin));
+		return sizeof(sin);
+	}
+#if IS_ENABLED(CONFIG_IPV6)
+	if (sock->ops->family == PF_INET6) {
+		struct sockaddr_in6 sin6 = {};
+
+		sin6.sin6_family = AF_INET6;
+		sin6.sin6_addr = in6addr_any;
+		sin6.sin6_port = 0;
+		memcpy(addr, &sin6, sizeof(sin6));
+		return sizeof(sin6);
+	}
+#endif
+	return -EINVAL;
+}
+
 static int trustcore_getname(struct socket *sock, struct sockaddr *addr, int peer)
 {
 	struct tc_sock *tc = tc_sk(sock->sk);
@@ -1648,7 +1673,7 @@ static int trustcore_getname(struct socket *sock, struct sockaddr *addr, int pee
 		return len;
 	}
 	if (!tc->local_len)
-		return -EINVAL;
+		return tc_getname_default_local(sock, addr);
 	memcpy(addr, &tc->local, tc->local_len);
 	return len;
 }
