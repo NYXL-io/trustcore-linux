@@ -2201,13 +2201,19 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 		 tc->stream_id, len, flags, sock->type, tc_trace_now_us());
 
 	if (sock->type == SOCK_DGRAM) {
-		if (!trustcore_net_ready())
+		if (!trustcore_net_ready()) {
+			TC_TRACE("recvmsg_fail stream_id=%llu err=%d reason=net_down flags=%d t_us=%llu\n",
+				 tc->stream_id, -ENETDOWN, flags, tc_trace_now_us());
 			return -ENETDOWN;
+		}
 
 		if (!tc->dgram_host_ready) {
 			rc = trustcore_dgram_bind_host(sock, flags & MSG_DONTWAIT);
-			if (rc)
+			if (rc) {
+				TC_TRACE("recvmsg_fail stream_id=%llu err=%d reason=bind_host flags=%d t_us=%llu\n",
+					 tc->stream_id, rc, flags, tc_trace_now_us());
 				return rc;
+			}
 		}
 
 		for (;;) {
@@ -2220,8 +2226,11 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 			if (buf)
 				break;
 
-			if (flags & MSG_DONTWAIT)
+			if (flags & MSG_DONTWAIT) {
+				TC_TRACE("recvmsg_fail stream_id=%llu err=%d reason=empty_nowait flags=%d t_us=%llu\n",
+					 tc->stream_id, -EAGAIN, flags, tc_trace_now_us());
 				return -EAGAIN;
+			}
 
 			timeout = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
 			TC_TRACE("recvmsg_wait stream_id=%llu t_us=%llu\n",
@@ -2231,10 +2240,18 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 								   timeout);
 			TC_TRACE("recvmsg_wake stream_id=%llu rc=%ld t_us=%llu\n",
 				 tc->stream_id, wait_rc, tc_trace_now_us());
-			if (wait_rc <= 0)
+			if (wait_rc <= 0) {
+				TC_TRACE("recvmsg_fail stream_id=%llu err=%d reason=wait flags=%d wait_rc=%ld t_us=%llu\n",
+					 tc->stream_id,
+					 wait_rc == 0 ? -ETIMEDOUT : (int)wait_rc,
+					 flags, wait_rc, tc_trace_now_us());
 				return wait_rc == 0 ? -ETIMEDOUT : (int)wait_rc;
-			if (tc->closing)
+			}
+			if (tc->closing) {
+				TC_TRACE("recvmsg_fail stream_id=%llu err=%d reason=closing flags=%d t_us=%llu\n",
+					 tc->stream_id, 0, flags, tc_trace_now_us());
 				return 0;
+			}
 		}
 
 		if (len > buf->len)
@@ -2245,6 +2262,8 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 			tc->rx_queued_bufs--;
 			spin_unlock(&tc->rx_lock);
 			kfree(buf);
+			TC_TRACE("recvmsg_fail stream_id=%llu err=%d reason=copy_to_iter len=%zu flags=%d t_us=%llu\n",
+				 tc->stream_id, -EFAULT, len, flags, tc_trace_now_us());
 			return -EFAULT;
 		}
 		copied = len;
@@ -2255,6 +2274,9 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 				tc->rx_queued_bufs--;
 				spin_unlock(&tc->rx_lock);
 				kfree(buf);
+				TC_TRACE("recvmsg_fail stream_id=%llu err=%d reason=msg_name_too_small msg_namelen=%u addr_len=%u flags=%d t_us=%llu\n",
+					 tc->stream_id, -EINVAL, (u32)msg->msg_namelen, (u32)buf->addr_len,
+					 flags, tc_trace_now_us());
 				return -EINVAL;
 			}
 			memcpy(msg->msg_name, &buf->addr, buf->addr_len);
