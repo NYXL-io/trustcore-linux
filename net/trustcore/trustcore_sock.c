@@ -2269,28 +2269,16 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 		copied = len;
 		if (buf->addr_len && msg->msg_name) {
 			/*
-			 * Some callers pass a non-NULL msg_name with namelen=0 when
-			 * they don't actually want the peer address. Treat that as
-			 * "address not requested" instead of hard-failing the read.
+			 * Linux's __sys_recvfrom() always sets msg_namelen = 0
+			 * before calling the protocol handler; it is an OUTPUT
+			 * that the handler must fill in, not an input buffer
+			 * size.  Always copy the source address and set the
+			 * length so that move_addr_to_user() delivers it back
+			 * to userspace (required by c-ares source-address
+			 * validation, among others).
 			 */
-			if (msg->msg_namelen == 0) {
-				msg->msg_namelen = buf->addr_len;
-				TC_TRACE("recvmsg_addr_skip stream_id=%llu reason=namelen_zero addr_len=%u flags=%d t_us=%llu\n",
-					 tc->stream_id, (u32)buf->addr_len, flags, tc_trace_now_us());
-			} else if (msg->msg_namelen < buf->addr_len) {
-				spin_lock(&tc->rx_lock);
-				tc->rx_queued_bytes -= buf->len;
-				tc->rx_queued_bufs--;
-				spin_unlock(&tc->rx_lock);
-				kfree(buf);
-				TC_TRACE("recvmsg_fail stream_id=%llu err=%d reason=msg_name_too_small msg_namelen=%u addr_len=%u flags=%d t_us=%llu\n",
-					 tc->stream_id, -EINVAL, (u32)msg->msg_namelen, (u32)buf->addr_len,
-					 flags, tc_trace_now_us());
-				return -EINVAL;
-			} else {
-				memcpy(msg->msg_name, &buf->addr, buf->addr_len);
-				msg->msg_namelen = buf->addr_len;
-			}
+			memcpy(msg->msg_name, &buf->addr, buf->addr_len);
+			msg->msg_namelen = buf->addr_len;
 		}
 		if (len < buf->len)
 			msg->msg_flags |= MSG_TRUNC;
