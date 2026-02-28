@@ -2268,7 +2268,15 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 		}
 		copied = len;
 		if (buf->addr_len && msg->msg_name) {
-			if (msg->msg_namelen < buf->addr_len) {
+			/*
+			 * Some callers pass a non-NULL msg_name with namelen=0 when
+			 * they don't actually want the peer address. Treat that as
+			 * "address not requested" instead of hard-failing the read.
+			 */
+			if (msg->msg_namelen == 0) {
+				TC_TRACE("recvmsg_addr_skip stream_id=%llu reason=namelen_zero addr_len=%u flags=%d t_us=%llu\n",
+					 tc->stream_id, (u32)buf->addr_len, flags, tc_trace_now_us());
+			} else if (msg->msg_namelen < buf->addr_len) {
 				spin_lock(&tc->rx_lock);
 				tc->rx_queued_bytes -= buf->len;
 				tc->rx_queued_bufs--;
@@ -2278,9 +2286,10 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 					 tc->stream_id, -EINVAL, (u32)msg->msg_namelen, (u32)buf->addr_len,
 					 flags, tc_trace_now_us());
 				return -EINVAL;
+			} else {
+				memcpy(msg->msg_name, &buf->addr, buf->addr_len);
+				msg->msg_namelen = buf->addr_len;
 			}
-			memcpy(msg->msg_name, &buf->addr, buf->addr_len);
-			msg->msg_namelen = buf->addr_len;
 		}
 		if (len < buf->len)
 			msg->msg_flags |= MSG_TRUNC;
