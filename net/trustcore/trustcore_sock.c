@@ -2274,6 +2274,7 @@ static int trustcore_recvmsg(struct socket *sock, struct msghdr *msg, size_t len
 			 * "address not requested" instead of hard-failing the read.
 			 */
 			if (msg->msg_namelen == 0) {
+				msg->msg_namelen = buf->addr_len;
 				TC_TRACE("recvmsg_addr_skip stream_id=%llu reason=namelen_zero addr_len=%u flags=%d t_us=%llu\n",
 					 tc->stream_id, (u32)buf->addr_len, flags, tc_trace_now_us());
 			} else if (msg->msg_namelen < buf->addr_len) {
