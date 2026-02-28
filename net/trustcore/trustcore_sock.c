@@ -1302,8 +1302,17 @@ static int trustcore_connect(struct socket *sock, struct sockaddr *addr,
 			return rc;
 		}
 
-		if (nonblock)
-			return -EINPROGRESS;
+		if (nonblock) {
+			/*
+			 * UDP connect is expected to complete immediately from
+			 * userspace point of view (for example c-ares in gRPC).
+			 * Keep the control-plane request in flight, but report
+			 * success now so callers can send on the connected socket
+			 * without treating connect() as a transient failure.
+			 */
+			tc->dgram_connected = true;
+			return 0;
+		}
 
 		timeout = sock_sndtimeo(sk, flags & O_NONBLOCK);
 		wait_rc = wait_event_interruptible_timeout(tc->wait,
