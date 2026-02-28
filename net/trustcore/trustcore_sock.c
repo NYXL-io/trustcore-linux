@@ -1309,8 +1309,17 @@ static int trustcore_connect(struct socket *sock, struct sockaddr *addr,
 			 * Keep the control-plane request in flight, but report
 			 * success now so callers can send on the connected socket
 			 * without treating connect() as a transient failure.
+			 *
+			 * Mark host-ready optimistically as well so immediate
+			 * connected send() calls are not blocked on pending_req_id
+			 * in trustcore_dgram_bind_host(). The control plane will
+			 * still resolve the in-flight connect response and can
+			 * close/err the socket if the connect ultimately fails.
 			 */
+			tc->dgram_host_ready = true;
 			tc->dgram_connected = true;
+			TC_TRACE("dgram_connect_nonblock_ok stream_id=%llu req_id=%llu t_us=%llu\n",
+				 tc->stream_id, desc.req_id, tc_trace_now_us());
 			return 0;
 		}
 
@@ -2048,6 +2057,8 @@ static int trustcore_sendmsg(struct socket *sock, struct msghdr *msg, size_t len
 		u32 max_payload;
 
 		if (!trustcore_net_ready()) {
+			TC_TRACE("dgram_send_fail stream_id=%llu err=%d reason=net_down t_us=%llu\n",
+				 tc->stream_id, ENETDOWN, tc_trace_now_us());
 			return -ENETDOWN;
 		}
 		if (!len)
@@ -2057,25 +2068,36 @@ static int trustcore_sendmsg(struct socket *sock, struct msghdr *msg, size_t len
 			const struct sockaddr *sa = msg->msg_name;
 
 			if (msg->msg_namelen < sizeof(sa_family_t)) {
+				TC_TRACE("dgram_send_fail stream_id=%llu err=%d reason=bad_namelen t_us=%llu\n",
+					 tc->stream_id, EINVAL, tc_trace_now_us());
 				return -EINVAL;
 			}
 			if (sock->ops->family == PF_INET) {
 				if (sa->sa_family != AF_INET ||
 				    msg->msg_namelen != sizeof(struct sockaddr_in)) {
+					TC_TRACE("dgram_send_fail stream_id=%llu err=%d reason=bad_v4_name t_us=%llu\n",
+						 tc->stream_id, EINVAL, tc_trace_now_us());
 					return -EINVAL;
 				}
 			} else if (sock->ops->family == PF_INET6) {
 				if (sa->sa_family != AF_INET6 ||
 				    msg->msg_namelen != sizeof(struct sockaddr_in6)) {
+					TC_TRACE("dgram_send_fail stream_id=%llu err=%d reason=bad_v6_name t_us=%llu\n",
+						 tc->stream_id, EINVAL, tc_trace_now_us());
 					return -EINVAL;
 				}
 			} else {
+				TC_TRACE("dgram_send_fail stream_id=%llu err=%d reason=bad_family t_us=%llu\n",
+					 tc->stream_id, EINVAL, tc_trace_now_us());
 				return -EINVAL;
 			}
 			daddr = sa;
 			daddr_len = msg->msg_namelen;
 		} else {
 			if (!tc->dgram_connected || !tc->peer_len) {
+				TC_TRACE("dgram_send_fail stream_id=%llu err=%d reason=not_connected connected=%d peer_len=%u t_us=%llu\n",
+					 tc->stream_id, ENOTCONN, tc->dgram_connected,
+					 tc->peer_len, tc_trace_now_us());
 				return -ENOTCONN;
 			}
 		}
@@ -2086,15 +2108,21 @@ static int trustcore_sendmsg(struct socket *sock, struct msghdr *msg, size_t len
 		if (!tc->dgram_host_ready) {
 			rc = trustcore_dgram_bind_host(sock, nonblock);
 			if (rc) {
+				TC_TRACE("dgram_send_fail stream_id=%llu err=%d reason=bind_host t_us=%llu\n",
+					 tc->stream_id, rc, tc_trace_now_us());
 				return rc == -ENOSPC ? -EAGAIN : rc;
 			}
 		}
 
 		max_payload = trustcore_net_max_payload();
 		if (!max_payload) {
+			TC_TRACE("dgram_send_fail stream_id=%llu err=%d reason=no_payload t_us=%llu\n",
+				 tc->stream_id, ENETDOWN, tc_trace_now_us());
 			return -ENETDOWN;
 		}
 		if (len > max_payload) {
+			TC_TRACE("dgram_send_fail stream_id=%llu err=%d reason=msgsize len=%zu max=%u t_us=%llu\n",
+				 tc->stream_id, EMSGSIZE, len, max_payload, tc_trace_now_us());
 			return -EMSGSIZE;
 		}
 
@@ -2111,6 +2139,8 @@ static int trustcore_sendmsg(struct socket *sock, struct msghdr *msg, size_t len
 							  daddr, daddr_len,
 							  nonblock);
 			if (rc) {
+				TC_TRACE("dgram_send_fail stream_id=%llu err=%d reason=ring_send t_us=%llu\n",
+					 tc->stream_id, rc, tc_trace_now_us());
 				if (rc == -ENOSPC)
 					rc = -EAGAIN;
 				return rc;
