@@ -1686,7 +1686,7 @@ static int trustcore_getname(struct socket *sock, struct sockaddr *addr, int pee
 			return -ENOTCONN;
 		}
 		if (!tc->peer_len)
-			return -ENOTCONN;
+			return tc_getname_default_local(sock, addr);
 		memcpy(addr, &tc->peer, tc->peer_len);
 		return len;
 	}
